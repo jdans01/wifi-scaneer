@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-WiFi-Wall-Vision v17 - Compatible Windows y Linux, con entorno virtual automático
-- Se autovirtualiza en .venv si no se está ejecutando dentro de un venv.
+WiFi-Wall-Vision v18 - Compatible Windows y Linux, venv + Python automático
+- En Windows con Python 3.13+: descarga e instala Python 3.12 automáticamente.
+- Se autovirtualiza en .venv (recrea si la versión de Python cambia).
 - Detecta el SO y adapta todos los comandos automáticamente.
 - Instala y configura pyrtlsdr + DLLs en Windows.
 - Escaneo de potencia WiFi (RTL-SDR) con gráfica.
@@ -9,71 +10,269 @@ WiFi-Wall-Vision v17 - Compatible Windows y Linux, con entorno virtual automáti
 - Modelo WiFiCam integrado (descarga automática).
 """
 
-from __future__ import annotations  # permite type hints en Python 3.9
+from __future__ import annotations
 
 import sys
 import os
+import subprocess
+import urllib.request
+import shutil
 
 # ─────────────────────────────────────────────────────────────
-# Bootstrap de entorno virtual  (debe ir ANTES de cualquier import externo)
+# Constantes de versión objetivo
+# ─────────────────────────────────────────────────────────────
+
+# pyrtlsdr requiere Python <= 3.12 (sin wheel para 3.13+)
+_NEED_PY_MAX  = (3, 12)
+_TARGET_PY    = "3.12.10"   # versión a instalar si hace falta
+_TARGET_PY_URL = (
+    f"https://www.python.org/ftp/python/{_TARGET_PY}/"
+    f"python-{_TARGET_PY}-amd64.exe"
+)
+
+# ─────────────────────────────────────────────────────────────
+# Gestión automática de versión Python (solo Windows, solo si hace falta)
+# ─────────────────────────────────────────────────────────────
+
+def _reexec(python_exe: str, extra_env: dict | None = None) -> None:
+    """Reemplaza el proceso actual con python_exe ejecutando este mismo script."""
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    try:
+        os.execve(python_exe, [python_exe] + sys.argv, env)
+    except (AttributeError, OSError):
+        result = subprocess.run([python_exe] + sys.argv, env=env)
+        sys.exit(result.returncode)
+
+
+def _venv_python_version(venv_dir: str) -> tuple[int, int] | None:
+    """Lee la versión de Python del pyvenv.cfg del venv."""
+    cfg = os.path.join(venv_dir, "pyvenv.cfg")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith("version"):
+                    ver = line.split("=", 1)[1].strip()   # "3.14.3"
+                    parts = ver.split(".")
+                    return (int(parts[0]), int(parts[1]))
+    except Exception:
+        pass
+    return None
+
+
+def _find_compatible_python() -> str | None:
+    """
+    Busca Python 3.11 o 3.12 ya instalado en Windows.
+    Prueba el Python Launcher (py.exe) y rutas comunes de instalación.
+    """
+    for minor in (12, 11):
+        # Python Launcher para Windows (viene con Python >= 3.3)
+        try:
+            r = subprocess.run(
+                ["py", f"-3.{minor}", "-c", "import sys; print(sys.executable)"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                exe = r.stdout.strip()
+                if os.path.isfile(exe):
+                    return exe
+        except Exception:
+            pass
+
+        # Rutas típicas de instalación manual y Microsoft Store
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+        candidates = [
+            os.path.join(local_app, "Programs", "Python", f"Python3{minor}", "python.exe"),
+            os.path.join(local_app, "Programs", "Python", f"Python{3}{minor}", "python.exe"),
+            rf"C:\Python3{minor}\python.exe",
+            os.path.join(program_files, f"Python 3.{minor}", "python.exe"),
+            os.path.join(program_files, f"Python3{minor}", "python.exe"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+
+    return None
+
+
+def _install_python_312() -> str | None:
+    """
+    Descarga e instala Python 3.12 silenciosamente para el usuario actual.
+    No requiere permisos de administrador (InstallAllUsers=0).
+    Devuelve la ruta al python.exe instalado, o None si falló.
+    """
+    import tempfile
+
+    local_app  = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    target_dir = os.path.join(local_app, "Programs", "Python", "Python312")
+    exe_path   = os.path.join(target_dir, "python.exe")
+
+    if os.path.isfile(exe_path):
+        return exe_path   # ya instalado por una ejecución anterior
+
+    print(f"\n🌐 Descargando Python {_TARGET_PY} (~25 MB)...")
+    print(f"   Fuente: {_TARGET_PY_URL}")
+
+    tmp_fd, tmp_installer = tempfile.mkstemp(suffix=".exe", prefix="py_installer_")
+    os.close(tmp_fd)
+
+    try:
+        def _progress(count, block, total):
+            if total > 0:
+                pct = min(100, count * block * 100 // total)
+                print(f"\r   {pct}% descargado...", end="", flush=True)
+
+        urllib.request.urlretrieve(_TARGET_PY_URL, tmp_installer, _progress)
+        print()   # nueva línea tras la barra de progreso
+    except Exception as e:
+        print(f"\n   ❌ Error al descargar: {e}")
+        try:
+            os.remove(tmp_installer)
+        except OSError:
+            pass
+        return None
+
+    print(f"🔧 Instalando Python {_TARGET_PY} en: {target_dir}")
+    print("   (instalación silenciosa de usuario, sin privilegios de administrador)")
+    try:
+        result = subprocess.run(
+            [
+                tmp_installer,
+                "/quiet",
+                "InstallAllUsers=0",
+                "PrependPath=0",        # no modificar PATH del sistema
+                "Include_launcher=0",   # no instalar py.exe de nuevo
+                f"TargetDir={target_dir}",
+            ],
+            timeout=300,
+        )
+    except Exception as e:
+        print(f"   ❌ Error durante la instalación: {e}")
+        return None
+    finally:
+        try:
+            os.remove(tmp_installer)
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        print(f"   ❌ El instalador salió con código {result.returncode}.")
+        print("   Instala Python 3.12 manualmente: https://www.python.org/downloads/")
+        return None
+
+    if os.path.isfile(exe_path):
+        print(f"   ✅ Python {_TARGET_PY} instalado.")
+        return exe_path
+
+    print("   ❌ No se encontró python.exe tras la instalación.")
+    return None
+
+
+def _ensure_compatible_python_windows() -> None:
+    """
+    En Windows con Python >= 3.13:
+      1. Busca Python 3.11/3.12 ya instalado.
+      2. Si no existe, descarga e instala Python 3.12.
+      3. Re-ejecuta este script con la versión compatible.
+    """
+    if sys.platform != "win32":
+        return
+    if sys.version_info <= _NEED_PY_MAX:
+        return
+    if os.environ.get("_WIFIVISION_PYTHON_OK") == "1":
+        # Ya pasamos por aquí; seguimos aunque la versión no sea ideal
+        return
+
+    print(f"\n⚠️  Python {sys.version_info.major}.{sys.version_info.minor} detectado.")
+    print(f"   pyrtlsdr (RTL-SDR) solo tiene wheels para Python ≤ 3.12.")
+    print("   Buscando Python 3.12 en el sistema...")
+
+    py_exec = _find_compatible_python()
+
+    if py_exec:
+        print(f"   ✅ Encontrado: {py_exec}")
+    else:
+        print("   No encontrado.")
+        resp = input(f"   ¿Instalar Python {_TARGET_PY} automáticamente? [S/n]: ").strip().lower()
+        if resp not in ("", "s", "si", "y", "yes"):
+            print("   Omitido — pyrtlsdr no estará disponible.")
+            os.environ["_WIFIVISION_PYTHON_OK"] = "1"
+            return
+        py_exec = _install_python_312()
+
+    if py_exec is None:
+        print("   ❌ No se pudo obtener Python 3.12. Continuando con la versión actual.")
+        os.environ["_WIFIVISION_PYTHON_OK"] = "1"
+        return
+
+    # Borrar el venv creado con Python 3.14 para que se recree con 3.12
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_dir   = os.path.join(script_dir, ".venv")
+    if os.path.isdir(venv_dir):
+        venv_ver = _venv_python_version(venv_dir)
+        cur_ver  = (sys.version_info.major, sys.version_info.minor)
+        if venv_ver and venv_ver != cur_ver:
+            print(f"   ♻️  Eliminando venv de Python {venv_ver[0]}.{venv_ver[1]} para recrearlo con 3.12...")
+            shutil.rmtree(venv_dir, ignore_errors=True)
+
+    print(f"🚀 Relanzando con Python {_TARGET_PY[:4]}...")
+    _reexec(py_exec, {"_WIFIVISION_PYTHON_OK": "1", "_WIFIVISION_VENV_ACTIVE": ""})
+
+
+_ensure_compatible_python_windows()
+
+# ─────────────────────────────────────────────────────────────
+# Bootstrap de entorno virtual
 # ─────────────────────────────────────────────────────────────
 
 def _bootstrap_venv() -> None:
     """
-    Si el script NO está corriendo dentro de un entorno virtual,
-    crea '.venv' junto al script y se relanza automáticamente dentro de él.
-    Esto garantiza que todos los paquetes quedan aislados del sistema.
+    Crea y activa .venv/ junto al script si no estamos ya dentro de un venv.
+    Si el venv existente fue creado con una versión distinta de Python, lo recrea.
     """
-    # Ya estamos en un venv (sys.prefix != sys.base_prefix) → nada que hacer
-    if sys.prefix != sys.base_prefix:
-        return
-
-    # Variable de guardia para evitar bucles infinitos
-    if os.environ.get("_WIFIVISION_VENV_ACTIVE") == "1":
-        return
-
     script_dir = os.path.dirname(os.path.abspath(__file__))
     venv_dir   = os.path.join(script_dir, ".venv")
+    _win       = sys.platform == "win32"
 
-    _win = sys.platform == "win32"
     python_in_venv = os.path.join(
         venv_dir,
         "Scripts" if _win else "bin",
         "python.exe" if _win else "python",
     )
 
-    # Crear el venv si no existe
-    if not os.path.exists(python_in_venv):
+    # Ya dentro del venv correcto → nada que hacer
+    if sys.prefix != sys.base_prefix:
+        venv_ver = _venv_python_version(venv_dir)
+        cur_ver  = (sys.version_info.major, sys.version_info.minor)
+        if venv_ver and venv_ver == cur_ver:
+            return
+        # Versión distinta → recrear (puede pasar si el usuario cambió Python)
+        print(f"♻️  Venv de Python {venv_ver} detectado; recreando con Python {cur_ver}...")
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+    if os.environ.get("_WIFIVISION_VENV_ACTIVE") == "1":
+        return
+
+    if not os.path.isfile(python_in_venv):
         print("🔧 Creando entorno virtual en .venv/ ...")
-        import venv as _venv
-        _venv.create(venv_dir, with_pip=True, clear=False)
+        import venv as _venv_mod
+        _venv_mod.create(venv_dir, with_pip=True, clear=True)
         print("✅ Entorno virtual creado.")
 
-    print(f"🚀 Relanzando dentro del entorno virtual...")
-    env = os.environ.copy()
-    env["_WIFIVISION_VENV_ACTIVE"] = "1"
-
-    # os.execve reemplaza el proceso actual (sin bifurcar)
-    try:
-        os.execve(python_in_venv, [python_in_venv] + sys.argv, env)
-    except AttributeError:
-        # Windows a veces no tiene os.execve disponible en algunas builds
-        import subprocess as _sp
-        result = _sp.run([python_in_venv] + sys.argv, env=env)
-        sys.exit(result.returncode)
+    print("🚀 Relanzando dentro del entorno virtual...")
+    _reexec(python_in_venv, {"_WIFIVISION_VENV_ACTIVE": "1"})
 
 
 _bootstrap_venv()
 
 # ─────────────────────────────────────────────────────────────
-# A partir de aquí ya estamos DENTRO del venv
+# A partir de aquí: dentro del venv con la versión correcta de Python
 # ─────────────────────────────────────────────────────────────
 
 import time
 import glob
-import subprocess
-import urllib.request
-import shutil
 import zipfile
 import platform
 import importlib

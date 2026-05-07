@@ -99,17 +99,39 @@ HAS_DISPLAY = _has_display()
 # Instalación dinámica de paquetes
 # ─────────────────────────────────────────────────────────────
 
-def _pip_install(pip_name: str) -> bool:
+def _pip_install(pip_name: str, show_output: bool = False) -> bool:
+    """Instala un paquete con pip. show_output=True muestra stderr si falla."""
     try:
-        subprocess.check_call(
+        kwargs: dict = {}
+        if not show_output:
+            kwargs["stdout"] = subprocess.DEVNULL
+            kwargs["stderr"] = subprocess.PIPE
+        result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--quiet", pip_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            **kwargs,
         )
+        if result.returncode != 0:
+            if not show_output and result.stderr:
+                # Mostrar solo la última línea de error (suele ser la relevante)
+                last = result.stderr.decode(errors="replace").strip().splitlines()
+                if last:
+                    print(f"   pip: {last[-1]}")
+            return False
         return True
     except Exception as e:
         print(f"   ❌ Error al instalar {pip_name}: {e}")
         return False
+
+
+def _invalidate_import_cache(module_name: str) -> None:
+    """
+    Limpia el caché de importación para que Python redescubra un módulo
+    recién instalado con pip sin necesidad de reiniciar el intérprete.
+    """
+    # Eliminar entradas negativas (módulos que no se encontraron antes)
+    sys.modules.pop(module_name, None)
+    # Refrescar los finders (PathFinder reconstruye sys.path_importer_cache)
+    importlib.invalidate_caches()
 
 
 def _import(module_path: str):
@@ -138,7 +160,8 @@ def ensure_package(pip_name: str, module_path: str | None = None):
         return None
 
     print(f"   Instalando {pip_name}...")
-    if _pip_install(pip_name):
+    if _pip_install(pip_name, show_output=True):
+        _invalidate_import_cache(module_path.split(".")[0])
         mod = _import(module_path)
         if mod is not None:
             print(f"   ✅ {pip_name} instalado.")
@@ -368,17 +391,16 @@ def _load_rtlsdr():
     if resp not in ("", "s", "si", "y", "yes"):
         return None
 
-    # En Windows instalamos también librtlsdr, que empaqueta rtlsdr.dll
-    # como parte de su wheel (evita tener que descargar DLLs manualmente)
-    if IS_WINDOWS:
-        print("   Instalando librtlsdr (incluye rtlsdr.dll)...")
-        _pip_install("librtlsdr")
-
     print("   Instalando pyrtlsdr...")
-    if not _pip_install("pyrtlsdr"):
+    if not _pip_install("pyrtlsdr", show_output=True):
+        print("   ❌ pip falló al instalar pyrtlsdr.")
         return None
 
-    # Tras instalar, registrar el directorio donde quedaron las DLLs
+    # Limpiar caché de importación para que Python encuentre el módulo
+    # recién instalado sin necesidad de reiniciar el intérprete
+    _invalidate_import_cache("rtlsdr")
+
+    # Registrar DLLs ANTES de intentar importar (el import las necesita en PATH)
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
 
@@ -390,9 +412,20 @@ def _load_rtlsdr():
     if err and err.startswith("dll_error"):
         print(f"   ❌ pyrtlsdr instalado pero DLLs no resueltas.")
         print(f"      Detalle: {err.split(':', 1)[-1]}")
-        _ensure_rtlsdr_dlls_windows()   # último intento con instrucciones manuales
+        _ensure_rtlsdr_dlls_windows()
     else:
-        print(f"   ❌ No se pudo importar pyrtlsdr: {err}")
+        # Verificar si pip realmente lo instaló
+        check = subprocess.run(
+            [sys.executable, "-m", "pip", "show", "pyrtlsdr"],
+            capture_output=True, text=True,
+        )
+        if "Location:" in check.stdout:
+            loc = [l for l in check.stdout.splitlines() if l.startswith("Location:")]
+            print(f"   pyrtlsdr instalado en: {loc[0] if loc else '?'}")
+            print(f"   Error de importación: {err}")
+            print("   Prueba cerrar y volver a abrir la terminal, luego ejecuta de nuevo.")
+        else:
+            print(f"   ❌ pyrtlsdr no aparece instalado. Error: {err}")
     return None
 
 

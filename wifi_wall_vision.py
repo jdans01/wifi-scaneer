@@ -95,34 +95,89 @@ def ensure_package(pip_name: str, module_path: str | None = None):
 # ─────────────────────────────────────────────────────────────
 
 def _ensure_rtlsdr_dlls_windows() -> bool:
-    """Descarga las DLL de RTL-SDR en Windows si no están presentes."""
+    """
+    Garantiza que rtlsdr.dll y libusb-1.0.dll están accesibles en Windows.
+    Estrategia:
+      1. Ya existen en el directorio de trabajo → registrar y salir.
+      2. Buscarlas dentro de los paquetes pip instalados (pyrtlsdr / librtlsdr).
+      3. Descargar desde múltiples mirrors hasta que uno funcione.
+      4. Si todo falla, mostrar instrucciones manuales.
+    """
     dll_names = ["rtlsdr.dll", "libusb-1.0.dll"]
-    if all(os.path.exists(d) for d in dll_names):
+
+    def _register_dll_dir(directory: str) -> None:
         try:
-            os.add_dll_directory(os.getcwd())
+            os.add_dll_directory(directory)
         except Exception:
             pass
+        # Añadir también al PATH para cubrir Python < 3.8
+        os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
+
+    # ── 1. Ya presentes en CWD ──────────────────────────────────
+    if all(os.path.exists(d) for d in dll_names):
+        _register_dll_dir(os.getcwd())
         return True
 
-    print("🌐 Faltan DLL de RTL-SDR. Descargando...")
-    url = (
-        "https://github.com/osmocom/rtl-sdr/releases/download/v0.6.0/"
-        "rtl-sdr-0.6.0-win32.zip"
-    )
-    zip_path = "rtl-sdr-dlls.zip"
+    # ── 2. Buscar dentro de site-packages (pyrtlsdr / librtlsdr) ─
     try:
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, "r") as z:
-            for name in z.namelist():
-                if name.endswith(".dll"):
-                    z.extract(name, ".")
-        os.remove(zip_path)
-        os.add_dll_directory(os.getcwd())
-        print("✅ DLLs instaladas.")
-        return True
-    except Exception as e:
-        print(f"❌ Error al descargar DLLs: {e}")
-        return False
+        import site
+        search_roots = site.getsitepackages() + [site.getusersitepackages()]
+        for root in search_roots:
+            for dirpath, _, filenames in os.walk(root):
+                if "rtlsdr.dll" in filenames:
+                    print(f"   ✅ DLL encontrada en: {dirpath}")
+                    _register_dll_dir(dirpath)
+                    return True
+    except Exception:
+        pass
+
+    # ── 3. Descargar desde mirrors ──────────────────────────────
+    # URLs en orden de preferencia (64-bit primero, luego 32-bit)
+    mirrors = [
+        # Osmocom FTP (binarios oficiales pre-compilados)
+        "https://ftp.osmocom.org/binaries/windows/rtl-sdr/RelWithDebInfo/rtl-sdr-64bit-20230513.zip",
+        # RTL-SDR Blog release (driver mejorado V4)
+        "https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest/download/Release.zip",
+        # Osmocom GitHub — versión 0.6.0 32-bit (legacy fallback)
+        "https://github.com/osmocom/rtl-sdr/releases/download/v0.6.0/rtl-sdr-0.6.0-win32.zip",
+    ]
+
+    print("🌐 Descargando DLLs de RTL-SDR (probando mirrors)...")
+    zip_path = "rtl-sdr-dlls.zip"
+
+    for url in mirrors:
+        print(f"   → {url.split('/')[2]}...")
+        try:
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path, "r") as z:
+                dll_members = [n for n in z.namelist() if n.lower().endswith(".dll")]
+                if not dll_members:
+                    continue
+                dll_dir = os.path.join(os.getcwd(), "rtlsdr_dlls")
+                os.makedirs(dll_dir, exist_ok=True)
+                for name in dll_members:
+                    z.extract(name, dll_dir)
+                    # Aplanar subdirectorios: mover al nivel raíz de dll_dir
+                    extracted = os.path.join(dll_dir, name)
+                    dest = os.path.join(dll_dir, os.path.basename(name))
+                    if extracted != dest:
+                        shutil.move(extracted, dest)
+            os.remove(zip_path)
+            _register_dll_dir(dll_dir)
+            print(f"   ✅ DLLs instaladas en: {dll_dir}")
+            return True
+        except Exception as e:
+            print(f"   ✗ Falló ({e})")
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+    # ── 4. Instrucciones manuales ───────────────────────────────
+    print("\n❌ No se pudieron descargar las DLLs automáticamente.")
+    print("   Instálalas manualmente:")
+    print("   1. Descarga desde: https://ftp.osmocom.org/binaries/windows/rtl-sdr/")
+    print("   2. Extrae rtlsdr.dll y libusb-1.0.dll junto a este script.")
+    print("   3. Instala el driver WinUSB con Zadig: https://zadig.akeo.ie")
+    return False
 
 
 def _check_rtlsdr_linux() -> None:
@@ -155,31 +210,75 @@ def _check_rtlsdr_linux() -> None:
         print("   o manualmente:   https://github.com/osmocom/rtl-sdr")
 
 
+def _try_import_rtlsdr():
+    """
+    Intenta importar rtlsdr.
+    Devuelve (módulo, error_string).
+    error_string es None si el import funcionó.
+    """
+    try:
+        import importlib
+        mod = importlib.import_module("rtlsdr")
+        return mod, None
+    except ImportError:
+        return None, "not_installed"
+    except OSError as e:
+        # Suele ser un error de DLL no encontrada en Windows
+        return None, f"dll_error:{e}"
+    except Exception as e:
+        return None, str(e)
+
+
 def _load_rtlsdr():
     """Carga pyrtlsdr gestionando dependencias según el SO."""
-    if IS_WINDOWS:
-        _ensure_rtlsdr_dlls_windows()
-    elif IS_LINUX:
+    if IS_LINUX:
         _check_rtlsdr_linux()
 
-    mod = _import("rtlsdr")
+    # Primera pasada: intentar importar tal cual
+    if IS_WINDOWS:
+        _ensure_rtlsdr_dlls_windows()
+
+    mod, err = _try_import_rtlsdr()
     if mod is not None:
         return mod
 
+    if err and err.startswith("dll_error"):
+        # Módulo instalado pero DLLs no encontradas → reintentar tras buscarlas
+        print(f"\n⚠️  pyrtlsdr instalado pero faltan DLLs: {err.split(':', 1)[-1]}")
+        if IS_WINDOWS and _ensure_rtlsdr_dlls_windows():
+            mod, err = _try_import_rtlsdr()
+            if mod is not None:
+                print("   ✅ pyrtlsdr cargado correctamente.")
+                return mod
+        print("   ❌ No se pudo cargar pyrtlsdr incluso con las DLLs.")
+        return None
+
+    # Módulo no instalado
     print("\n⚠️  El módulo 'pyrtlsdr' no está instalado.")
     resp = input("   ¿Instalarlo ahora? [S/n]: ").strip().lower()
     if resp not in ("", "s", "si", "y", "yes"):
         return None
 
     print("   Instalando pyrtlsdr...")
-    if _pip_install("pyrtlsdr"):
-        if IS_WINDOWS:
-            _ensure_rtlsdr_dlls_windows()
-        mod = _import("rtlsdr")
-        if mod is not None:
-            print("   ✅ pyrtlsdr instalado.")
-            return mod
-    print("   ❌ No se pudo importar pyrtlsdr.")
+    if not _pip_install("pyrtlsdr"):
+        return None
+
+    # Tras instalar, asegurar DLLs antes de importar
+    if IS_WINDOWS:
+        _ensure_rtlsdr_dlls_windows()
+
+    mod, err = _try_import_rtlsdr()
+    if mod is not None:
+        print("   ✅ pyrtlsdr instalado y cargado.")
+        return mod
+
+    if err and err.startswith("dll_error"):
+        print(f"   ❌ pyrtlsdr instalado pero DLLs no resueltas: {err.split(':', 1)[-1]}")
+        print("   Descarga las DLLs manualmente desde:")
+        print("   https://ftp.osmocom.org/binaries/windows/rtl-sdr/")
+        print("   e instala el driver con Zadig: https://zadig.akeo.ie")
+    else:
+        print(f"   ❌ No se pudo importar pyrtlsdr: {err}")
     return None
 
 

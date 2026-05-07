@@ -175,66 +175,116 @@ def ensure_package(pip_name: str, module_path: str | None = None):
 # ─────────────────────────────────────────────────────────────
 
 def _register_dll_dir(directory: str) -> None:
-    """Registra un directorio de DLLs en Windows (dos métodos para máx. compatibilidad)."""
+    """Registra un directorio de DLLs en Windows (os.add_dll_directory + PATH)."""
     abs_dir = os.path.abspath(directory)
     try:
-        os.add_dll_directory(abs_dir)          # Python 3.8+ oficial
+        os.add_dll_directory(abs_dir)
     except Exception:
         pass
     os.environ["PATH"] = abs_dir + os.pathsep + os.environ.get("PATH", "")
 
 
-def _find_dll_in_site_packages() -> str | None:
-    """
-    Busca rtlsdr.dll dentro de los paquetes pip instalados.
-    pyrtlsdr >= 0.2.92 depende de 'librtlsdr' que instala la DLL en su carpeta.
-    """
-    try:
-        import site
-        roots = []
-        try:
-            roots += site.getsitepackages()
-        except Exception:
-            pass
-        try:
-            roots.append(site.getusersitepackages())
-        except Exception:
-            pass
+def _python_scripts_dir() -> str:
+    """Devuelve el directorio Scripts/ (Windows) del Python activo."""
+    return os.path.join(os.path.dirname(sys.executable))
 
-        for root in roots:
-            if not os.path.isdir(root):
-                continue
-            for dirpath, _, filenames in os.walk(root):
-                lower = [f.lower() for f in filenames]
-                if "rtlsdr.dll" in lower:
-                    return dirpath
+
+def _copy_dlls_to_scripts(dll_dir: str) -> None:
+    """
+    Copia las DLLs al directorio de python.exe del venv.
+    Es la ubicación más fiable en Windows: siempre está en PATH
+    y Python carga extensiones .pyd desde ahí sin necesitar add_dll_directory.
+    """
+    scripts = _python_scripts_dir()
+    try:
+        for fname in os.listdir(dll_dir):
+            if fname.lower().endswith(".dll"):
+                src = os.path.join(dll_dir, fname)
+                dst = os.path.join(scripts, fname)
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
     except Exception:
         pass
+
+
+def _check_python_version_rtlsdr() -> None:
+    """
+    pyrtlsdr publica wheels hasta Python 3.12.
+    En Python 3.13+ no hay wheel precompilado; pip intentará compilar desde
+    código C, lo que requiere Visual Studio Build Tools y puede fallar.
+    Avisamos al usuario con la solución concreta.
+    """
+    major, minor = sys.version_info.major, sys.version_info.minor
+    if major == 3 and minor >= 13:
+        print(f"\n⚠️  Python {major}.{minor} detectado.")
+        print("   pyrtlsdr no tiene wheel para Python 3.13+.")
+        print("   Para evitar errores de compilación, instala Python 3.11 o 3.12:")
+        print("   https://www.python.org/downloads/")
+        print("   Luego vuelve a ejecutar este script con esa versión.")
+        print("   (Continuando de todas formas — puede que funcione si tienes")
+        print("    Visual Studio Build Tools instalado)")
+
+
+def _find_dll_in_known_dirs() -> str | None:
+    """
+    Busca rtlsdr.dll en:
+    - site-packages del venv activo
+    - directorio del script
+    - directorio Scripts/ del venv
+    """
+    search_dirs: list[str] = []
+
+    # site-packages
+    try:
+        import site
+        try:
+            search_dirs += site.getsitepackages()
+        except Exception:
+            pass
+        try:
+            search_dirs.append(site.getusersitepackages())
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Directorio del script y Scripts/ del venv
+    search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    search_dirs.append(_python_scripts_dir())
+
+    # También ./rtlsdr_dlls/ si existe
+    local_dlls = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
+    if os.path.isdir(local_dlls):
+        search_dirs.append(local_dlls)
+
+    for root in search_dirs:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            lower = [f.lower() for f in filenames]
+            if "rtlsdr.dll" in lower:
+                return dirpath
+
     return None
 
 
 def _download_rtlsdr_dlls() -> str | None:
     """
-    Intenta descargar las DLLs de RTL-SDR desde GitHub (Releases con assets reales).
-    Usa un directorio temporal para el zip (evita problemas de permisos en CWD).
-    Devuelve el directorio donde se extrajeron las DLLs, o None si falló.
+    Descarga las DLLs de RTL-SDR desde GitHub Releases.
+    Usa tempfile para el zip (sin problemas de permisos en CWD).
+    Extrae en <script_dir>/rtlsdr_dlls/ y también copia a Scripts/.
     """
     import tempfile
 
-    # Solo incluimos URLs cuya existencia podemos razonar con certeza estructural:
-    #  - rtlsdrblog publica zips de release con nombre predecible
-    #  - Se busca el asset "Release.zip" del último tag publicado
     mirrors = [
-        # RTL-SDR Blog V4 — release con binarios Win64 (activo en 2024-2025)
         "https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest/download/Release.zip",
-        # Alternativa: Releases de la fork oficial de osmocom en GitHub Actions
         "https://github.com/osmocom/rtl-sdr/releases/latest/download/rtl-sdr-win64.zip",
     ]
 
     dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
     os.makedirs(dll_dir, exist_ok=True)
 
-    print("🌐 Intentando descargar DLLs de RTL-SDR...")
+    print("🌐 Descargando DLLs de RTL-SDR...")
     for url in mirrors:
         host = url.split("/")[2]
         repo = "/".join(url.split("/")[3:5])
@@ -246,14 +296,16 @@ def _download_rtlsdr_dlls() -> str | None:
             with zipfile.ZipFile(tmp_path, "r") as z:
                 dll_entries = [n for n in z.namelist() if n.lower().endswith(".dll")]
                 if not dll_entries:
-                    print("     ✗ El zip no contiene DLLs.")
+                    print("   ✗ El zip no contiene DLLs.")
                     continue
                 for entry in dll_entries:
                     data = z.read(entry)
                     dest = os.path.join(dll_dir, os.path.basename(entry))
                     with open(dest, "wb") as f:
                         f.write(data)
-            print(f"   ✅ DLLs extraídas en: {dll_dir}")
+            print(f"   ✅ DLLs descargadas en: {dll_dir}")
+            # Copiar también al Scripts/ del venv (máxima compatibilidad)
+            _copy_dlls_to_scripts(dll_dir)
             return dll_dir
         except Exception as e:
             print(f"   ✗ Falló: {e}")
@@ -268,47 +320,55 @@ def _download_rtlsdr_dlls() -> str | None:
 
 def _ensure_rtlsdr_dlls_windows() -> bool:
     """
-    Garantiza que rtlsdr.dll está accesible en Windows.
-    Orden de estrategias:
-      1. Ya está registrada / en PATH.
-      2. Buscar en site-packages del venv activo (pyrtlsdr / librtlsdr la incluye).
-      3. Descargar desde GitHub Releases con zip temporal (sin tocar el CWD).
-      4. Instrucciones manuales claras si todo falla.
+    Garantiza que rtlsdr.dll es cargable en Windows.
+    Estrategia:
+      1. ctypes ya puede cargarla (en PATH).
+      2. Buscar en site-packages / Scripts / rtlsdr_dlls → registrar.
+      3. Descargar de GitHub Releases → copiar a Scripts/.
+      4. Instrucciones manuales.
     """
-    # ── 1. Intentar importar directamente (puede que ya esté en PATH) ────
+    import ctypes
+
+    # ── 1. Ya cargable ────────────────────────────────────────────────────
     try:
-        import ctypes
         ctypes.CDLL("rtlsdr")
-        return True          # ya cargable
+        return True
     except OSError:
         pass
 
-    # ── 2. Buscar en site-packages ───────────────────────────────────────
-    found_dir = _find_dll_in_site_packages()
+    # ── 2. Buscar en ubicaciones conocidas ────────────────────────────────
+    found_dir = _find_dll_in_known_dirs()
     if found_dir:
-        print(f"   ✅ DLL de RTL-SDR encontrada en paquete pip: {found_dir}")
         _register_dll_dir(found_dir)
-        return True
+        _copy_dlls_to_scripts(found_dir)
+        try:
+            ctypes.CDLL("rtlsdr")
+            return True
+        except OSError:
+            pass  # continuar a descarga
 
-    # ── 3. Descargar ─────────────────────────────────────────────────────
+    # ── 3. Descargar ──────────────────────────────────────────────────────
     dll_dir = _download_rtlsdr_dlls()
     if dll_dir:
         _register_dll_dir(dll_dir)
-        return True
+        try:
+            ctypes.CDLL("rtlsdr")
+            return True
+        except OSError:
+            pass  # DLL descargada pero aún no cargable (raro)
 
     # ── 4. Instrucciones manuales ─────────────────────────────────────────
-    print("\n❌ No se encontraron las DLLs de RTL-SDR automáticamente.")
-    print("   Pasos para instalarlas manualmente:")
+    scripts = _python_scripts_dir()
+    print("\n❌ No se pudo preparar rtlsdr.dll automáticamente.")
+    print(f"   Copia manualmente rtlsdr.dll y libusb-1.0.dll a:")
+    print(f"   {scripts}")
     print()
-    print("   OPCIÓN A — Instalar el paquete librtlsdr (recomendado):")
-    print("     pip install librtlsdr")
+    print("   Descarga las DLLs de:")
+    print("   https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest")
+    print("   (archivo Release.zip → carpeta x64/)")
     print()
-    print("   OPCIÓN B — Descargar el binario oficial:")
-    print("     https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest")
-    print("     Descarga Release.zip → extrae rtlsdr.dll junto a este script.")
-    print()
-    print("   OPCIÓN C — Driver USB (necesario en todos los casos):")
-    print("     https://zadig.akeo.ie  →  selecciona el RTL-SDR → instala WinUSB")
+    print("   También necesitas el driver USB:")
+    print("   https://zadig.akeo.ie  →  RTL-SDR → WinUSB")
     return False
 
 
@@ -342,91 +402,100 @@ def _check_rtlsdr_linux() -> None:
         print("   o manualmente:   https://github.com/osmocom/rtl-sdr")
 
 
-def _try_import_rtlsdr():
+def _subprocess_can_import(module: str) -> bool:
     """
-    Intenta importar rtlsdr.
-    Devuelve (módulo, error_string).
-    error_string es None si el import funcionó.
+    Verifica si un módulo es importable lanzando un proceso Python limpio.
+    Esto evita el problema del caché de importación del proceso actual
+    y confirma si el paquete está realmente disponible en disco.
     """
-    try:
-        import importlib
-        mod = importlib.import_module("rtlsdr")
-        return mod, None
-    except ImportError:
-        return None, "not_installed"
-    except OSError as e:
-        # Suele ser un error de DLL no encontrada en Windows
-        return None, f"dll_error:{e}"
-    except Exception as e:
-        return None, str(e)
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        timeout=15,
+    )
+    return result.returncode == 0
 
 
 def _load_rtlsdr():
-    """Carga pyrtlsdr gestionando dependencias según el SO."""
+    """Carga pyrtlsdr en Windows/Linux con gestión completa de DLLs."""
     if IS_LINUX:
         _check_rtlsdr_linux()
 
-    # Primera pasada: intentar importar tal cual
+    # ── Paso 1: preparar DLLs en Windows antes del primer intento ────────
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
 
-    mod, err = _try_import_rtlsdr()
-    if mod is not None:
+    # ── Paso 2: intentar importar en el proceso actual ────────────────────
+    _invalidate_import_cache("rtlsdr")
+    try:
+        mod = importlib.import_module("rtlsdr")
         return mod
-
-    if err and err.startswith("dll_error"):
-        # Módulo instalado pero DLLs no encontradas → reintentar tras buscarlas
-        print(f"\n⚠️  pyrtlsdr instalado pero faltan DLLs: {err.split(':', 1)[-1]}")
-        if IS_WINDOWS and _ensure_rtlsdr_dlls_windows():
-            mod, err = _try_import_rtlsdr()
-            if mod is not None:
-                print("   ✅ pyrtlsdr cargado correctamente.")
+    except ImportError:
+        pass  # no instalado → continuar
+    except OSError as e:
+        # Instalado pero DLL no encontrada
+        print(f"\n⚠️  pyrtlsdr instalado pero falta una DLL: {e}")
+        if IS_WINDOWS:
+            _ensure_rtlsdr_dlls_windows()
+            _invalidate_import_cache("rtlsdr")
+            try:
+                mod = importlib.import_module("rtlsdr")
+                print("   ✅ pyrtlsdr cargado.")
                 return mod
-        print("   ❌ No se pudo cargar pyrtlsdr incluso con las DLLs.")
+            except Exception as e2:
+                print(f"   ❌ Sigue fallando: {e2}")
+        return None
+    except Exception as e:
+        print(f"⚠️  Error inesperado al importar rtlsdr: {e}")
         return None
 
-    # Módulo no instalado
+    # ── Paso 3: instalar ──────────────────────────────────────────────────
+    if IS_WINDOWS:
+        _check_python_version_rtlsdr()
+
     print("\n⚠️  El módulo 'pyrtlsdr' no está instalado.")
     resp = input("   ¿Instalarlo ahora? [S/n]: ").strip().lower()
     if resp not in ("", "s", "si", "y", "yes"):
         return None
 
     print("   Instalando pyrtlsdr...")
-    if not _pip_install("pyrtlsdr", show_output=True):
-        print("   ❌ pip falló al instalar pyrtlsdr.")
+    ok = _pip_install("pyrtlsdr", show_output=True)
+    if not ok:
+        print("   ❌ pip no pudo instalar pyrtlsdr.")
+        if IS_WINDOWS and sys.version_info >= (3, 13):
+            print("   Causa probable: no hay wheel para Python 3.13+.")
+            print("   Solución: usa Python 3.11 o 3.12.")
+            print("   Descarga: https://www.python.org/downloads/")
         return None
 
-    # Limpiar caché de importación para que Python encuentre el módulo
-    # recién instalado sin necesidad de reiniciar el intérprete
-    _invalidate_import_cache("rtlsdr")
+    # ── Paso 4: verificar con proceso limpio (sin caché de este proceso) ──
+    if not _subprocess_can_import("rtlsdr"):
+        # pip dijo OK pero el módulo no es importable → C extension sin compilar
+        print("   ⚠️  pyrtlsdr instalado pero no es importable.")
+        if IS_WINDOWS and sys.version_info >= (3, 13):
+            print("   No hay wheel precompilado para Python 3.13+.")
+            print("   ► Instala Python 3.11 o 3.12 y vuelve a ejecutar el script.")
+            print("     https://www.python.org/downloads/")
+        else:
+            print("   Revisa el error con:  pip install pyrtlsdr  (sin --quiet)")
+        return None
 
-    # Registrar DLLs ANTES de intentar importar (el import las necesita en PATH)
+    # ── Paso 5: registrar DLLs y cargar en el proceso actual ─────────────
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
 
-    mod, err = _try_import_rtlsdr()
-    if mod is not None:
+    _invalidate_import_cache("rtlsdr")
+    try:
+        mod = importlib.import_module("rtlsdr")
         print("   ✅ pyrtlsdr instalado y cargado.")
         return mod
-
-    if err and err.startswith("dll_error"):
-        print(f"   ❌ pyrtlsdr instalado pero DLLs no resueltas.")
-        print(f"      Detalle: {err.split(':', 1)[-1]}")
-        _ensure_rtlsdr_dlls_windows()
-    else:
-        # Verificar si pip realmente lo instaló
-        check = subprocess.run(
-            [sys.executable, "-m", "pip", "show", "pyrtlsdr"],
-            capture_output=True, text=True,
-        )
-        if "Location:" in check.stdout:
-            loc = [l for l in check.stdout.splitlines() if l.startswith("Location:")]
-            print(f"   pyrtlsdr instalado en: {loc[0] if loc else '?'}")
-            print(f"   Error de importación: {err}")
-            print("   Prueba cerrar y volver a abrir la terminal, luego ejecuta de nuevo.")
-        else:
-            print(f"   ❌ pyrtlsdr no aparece instalado. Error: {err}")
-    return None
+    except OSError as e:
+        print(f"   ❌ DLL no encontrada al importar: {e}")
+        print(f"   Copia rtlsdr.dll a: {_python_scripts_dir()}")
+        return None
+    except Exception as e:
+        print(f"   ❌ Error al importar: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────

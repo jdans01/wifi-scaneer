@@ -179,7 +179,8 @@ def _ensure_compatible_python_windows() -> None:
     """
     if sys.platform != "win32":
         return
-    if sys.version_info <= _NEED_PY_MAX:
+    # Comparar solo major.minor (sys.version_info es una tupla larga, ej. (3,12,10,'final',0))
+    if (sys.version_info.major, sys.version_info.minor) <= _NEED_PY_MAX:
         return
     if os.environ.get("_WIFIVISION_PYTHON_OK") == "1":
         # Ya pasamos por aquí; seguimos aunque la versión no sea ideal
@@ -1486,4 +1487,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Interrumpido por el usuario.")
+    except Exception as _exc:
+        import traceback
+        print("\n" + "=" * 60)
+        print("❌ ERROR INESPERADO — copia este texto si necesitas ayuda:")
+        print("=" * 60)
+        traceback.print_exc()
+        print("=" * 60)
+    finally:
+        # En Windows: mantener la ventana abierta para que el usuario lea los mensajes
+        if sys.platform == "win32":
+            input("\nPresiona Enter para cerrar...")

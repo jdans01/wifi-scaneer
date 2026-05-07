@@ -1,29 +1,36 @@
 @echo off
 :: WiFi-Wall-Vision - Launcher para Windows
-:: Ejecuta el script dentro del entorno virtual (.venv).
-:: Si .venv no existe, el propio script lo crea automáticamente.
-
 setlocal
 
-:: Directorio del script
 set "SCRIPT_DIR=%~dp0"
 set "VENV_PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe"
 set "MAIN=%SCRIPT_DIR%wifi_wall_vision.py"
 
-:: Si ya existe el venv, úsalo directamente (evita una re-ejecución extra)
+:: Verificar que Python esté disponible
+where python >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo ERROR: Python no encontrado en el PATH.
+    echo Descargalo de: https://www.python.org/downloads/
+    echo Marca "Add Python to PATH" durante la instalacion.
+    pause
+    exit /b 1
+)
+
+:: Si ya existe el venv con la versión correcta, úsalo directamente
 if exist "%VENV_PYTHON%" (
-    echo [WiFi-Wall-Vision] Usando entorno virtual existente...
     set "_WIFIVISION_VENV_ACTIVE=1"
     "%VENV_PYTHON%" "%MAIN%" %*
 ) else (
-    echo [WiFi-Wall-Vision] Primer arranque - se creara el entorno virtual...
     python "%MAIN%" %*
 )
 
-if %ERRORLEVEL% neq 0 (
+:: El script ya muestra "Presiona Enter para cerrar" en Windows,
+:: así que aquí solo capturamos el código de salida para diagnóstico.
+set EXIT_CODE=%ERRORLEVEL%
+if %EXIT_CODE% neq 0 (
     echo.
-    echo ERROR: El script termino con codigo %ERRORLEVEL%.
-    echo Asegurate de tener Python 3.9+ instalado y en el PATH.
+    echo [run.bat] El script salio con codigo de error: %EXIT_CODE%
     pause
 )
 endlocal

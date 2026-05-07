@@ -170,13 +170,25 @@ def _ensure_compatible_python_windows() -> None:
         os.environ["_WIFIVISION_PYTHON_OK"] = "1"
         return
 
-    # Eliminar venv antiguo si fue creado con otra versión
+    # Determinar la versión del ejecutable objetivo para comparar con el venv
+    try:
+        _r = subprocess.run(
+            [py_exec, "-c",
+             "import sys; print(sys.version_info.major, sys.version_info.minor)"],
+            capture_output=True, text=True, timeout=10,
+        )
+        _parts = _r.stdout.strip().split()
+        target_ver = (int(_parts[0]), int(_parts[1]))
+    except Exception:
+        target_ver = (3, 12)  # fallback
+
+    # Eliminar venv si no fue creado con la versión objetivo
     venv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv")
     if os.path.isdir(venv_dir):
         vv = _venv_python_version(venv_dir)
-        cv = (sys.version_info.major, sys.version_info.minor)
-        if vv and vv != cv:
-            print(f"   ♻️  Eliminando venv Python {vv[0]}.{vv[1]} para recrear con 3.12...")
+        if vv != target_ver:
+            ver_str = f"{vv[0]}.{vv[1]}" if vv else "desconocida"
+            print(f"   ♻️  Eliminando venv Python {ver_str} para recrear con {target_ver[0]}.{target_ver[1]}...")
             shutil.rmtree(venv_dir, ignore_errors=True)
 
     print(f"🚀 Relanzando con Python 3.12...")
@@ -209,12 +221,22 @@ def _bootstrap_venv() -> None:
     if os.environ.get("_WIFIVISION_VENV_ACTIVE") == "1":
         return
 
-    if not os.path.isfile(py_in_venv):
-        print("⚙️  Creando entorno virtual (.venv)...")
-        import venv as _vm
-        _vm.create(venv_dir, with_pip=True, clear=True)
-        print("   ✅ Entorno virtual creado.")
+    cv = (sys.version_info.major, sys.version_info.minor)
 
+    if os.path.isfile(py_in_venv):
+        # Verificar que el venv coincide con el Python actual antes de activarlo
+        vv = _venv_python_version(venv_dir)
+        if vv and vv != cv:
+            print(f"♻️  Venv es Python {vv[0]}.{vv[1]}, actual es {cv[0]}.{cv[1]}. Recreando...")
+            shutil.rmtree(venv_dir, ignore_errors=True)
+        else:
+            print("🚀 Activando entorno virtual...")
+            _reexec(py_in_venv, {"_WIFIVISION_VENV_ACTIVE": "1"})
+
+    print("⚙️  Creando entorno virtual (.venv)...")
+    import venv as _vm
+    _vm.create(venv_dir, with_pip=True, clear=True)
+    print("   ✅ Entorno virtual creado.")
     print("🚀 Activando entorno virtual...")
     _reexec(py_in_venv, {"_WIFIVISION_VENV_ACTIVE": "1"})
 

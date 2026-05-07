@@ -34,14 +34,20 @@ _TARGET_PY_URL = (
 # ─────────────────────────────────────────────────────────────
 
 def _reexec(python_exe: str, extra_env: dict | None = None) -> None:
+    """
+    Relanza este script con python_exe.
+    En Windows usamos subprocess.run porque os.execve no reemplaza el proceso
+    actual de forma fiable (el padre continúa ejecutándose en paralelo).
+    En Unix usamos os.execve que sí reemplaza el proceso.
+    """
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    try:
-        os.execve(python_exe, [python_exe] + sys.argv, env)
-    except (AttributeError, OSError):
+    if sys.platform == "win32":
         result = subprocess.run([python_exe] + sys.argv, env=env)
         sys.exit(result.returncode)
+    else:
+        os.execve(python_exe, [python_exe] + sys.argv, env)
 
 # ─────────────────────────────────────────────────────────────
 # Gestión de versión Python (automática, sin preguntas)
@@ -316,7 +322,11 @@ def _register_dll_dir(directory: str) -> None:
 
 
 def _copy_dlls_to_scripts(src_dir: str) -> None:
-    """Copia las DLLs al directorio de python.exe (garantiza que estén en PATH)."""
+    """
+    Copia todas las DLLs al directorio de python.exe y crea alias
+    rtlsdr.dll ↔ librtlsdr.dll porque pyrtlsdr busca 'librtlsdr'
+    mientras el binario oficial se llama 'rtlsdr.dll'.
+    """
     dst = _scripts_dir()
     for fname in os.listdir(src_dir):
         if fname.lower().endswith(".dll"):
@@ -326,24 +336,40 @@ def _copy_dlls_to_scripts(src_dir: str) -> None:
             except Exception:
                 pass
 
+    # Crear alias bidireccional rtlsdr.dll / librtlsdr.dll
+    pairs = [
+        ("rtlsdr.dll",    "librtlsdr.dll"),
+        ("librtlsdr.dll", "rtlsdr.dll"),
+    ]
+    for src_name, alias_name in pairs:
+        src  = os.path.join(dst, src_name)
+        alias = os.path.join(dst, alias_name)
+        if os.path.isfile(src) and not os.path.isfile(alias):
+            try:
+                shutil.copy2(src, alias)
+            except Exception:
+                pass
+
 
 def _dll_loadable() -> bool:
-    """Verifica si rtlsdr.dll es cargable con ctypes."""
+    """Verifica si rtlsdr/librtlsdr es cargable con ctypes."""
     import ctypes
-    # Intentar con nombre simple (busca en PATH + add_dll_directory)
-    try:
-        ctypes.CDLL("rtlsdr")
-        return True
-    except OSError:
-        pass
-    # Intentar con ruta completa en Scripts/
-    full = os.path.join(_scripts_dir(), "rtlsdr.dll")
-    if os.path.isfile(full):
+    scripts = _scripts_dir()
+    for name in ("rtlsdr", "librtlsdr"):
+        # Por nombre simple (PATH / add_dll_directory)
         try:
-            ctypes.CDLL(full)
+            ctypes.CDLL(name)
             return True
         except OSError:
             pass
+        # Por ruta completa en Scripts/
+        full = os.path.join(scripts, f"{name}.dll")
+        if os.path.isfile(full):
+            try:
+                ctypes.CDLL(full)
+                return True
+            except OSError:
+                pass
     return False
 
 
@@ -460,6 +486,24 @@ def _check_rtlsdr_linux() -> None:
         print("   o manualmente:   https://github.com/osmocom/rtl-sdr")
 
 
+def _preload_rtlsdr_deps() -> None:
+    """
+    Pre-carga libusb-1.0.dll y rtlsdr.dll/librtlsdr.dll por ruta completa
+    antes de que Python intente importar el módulo rtlsdr.
+    Esto garantiza que Windows encuentre las dependencias aunque no estén
+    en %PATH% del sistema (solo en add_dll_directory o Scripts/).
+    """
+    import ctypes
+    scripts = _scripts_dir()
+    for dll in ("libusb-1.0.dll", "rtlsdr.dll", "librtlsdr.dll"):
+        path = os.path.join(scripts, dll)
+        if os.path.isfile(path):
+            try:
+                ctypes.CDLL(path)
+            except OSError:
+                pass
+
+
 def _load_rtlsdr():
     """Carga pyrtlsdr automáticamente (sin preguntas)."""
     if IS_LINUX:
@@ -468,6 +512,7 @@ def _load_rtlsdr():
     # Asegurar DLLs antes del primer import (Windows)
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
+        _preload_rtlsdr_deps()   # pre-cargar dependencias por ruta completa
 
     _invalidate_import_cache("rtlsdr")
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-WiFi-Wall-Vision v16 - Compatible Windows y Linux
+WiFi-Wall-Vision v17 - Compatible Windows y Linux, con entorno virtual automático
+- Se autovirtualiza en .venv si no se está ejecutando dentro de un venv.
 - Detecta el SO y adapta todos los comandos automáticamente.
 - Instala y configura pyrtlsdr + DLLs en Windows.
 - Escaneo de potencia WiFi (RTL-SDR) con gráfica.
@@ -12,6 +13,62 @@ from __future__ import annotations  # permite type hints en Python 3.9
 
 import sys
 import os
+
+# ─────────────────────────────────────────────────────────────
+# Bootstrap de entorno virtual  (debe ir ANTES de cualquier import externo)
+# ─────────────────────────────────────────────────────────────
+
+def _bootstrap_venv() -> None:
+    """
+    Si el script NO está corriendo dentro de un entorno virtual,
+    crea '.venv' junto al script y se relanza automáticamente dentro de él.
+    Esto garantiza que todos los paquetes quedan aislados del sistema.
+    """
+    # Ya estamos en un venv (sys.prefix != sys.base_prefix) → nada que hacer
+    if sys.prefix != sys.base_prefix:
+        return
+
+    # Variable de guardia para evitar bucles infinitos
+    if os.environ.get("_WIFIVISION_VENV_ACTIVE") == "1":
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_dir   = os.path.join(script_dir, ".venv")
+
+    _win = sys.platform == "win32"
+    python_in_venv = os.path.join(
+        venv_dir,
+        "Scripts" if _win else "bin",
+        "python.exe" if _win else "python",
+    )
+
+    # Crear el venv si no existe
+    if not os.path.exists(python_in_venv):
+        print("🔧 Creando entorno virtual en .venv/ ...")
+        import venv as _venv
+        _venv.create(venv_dir, with_pip=True, clear=False)
+        print("✅ Entorno virtual creado.")
+
+    print(f"🚀 Relanzando dentro del entorno virtual...")
+    env = os.environ.copy()
+    env["_WIFIVISION_VENV_ACTIVE"] = "1"
+
+    # os.execve reemplaza el proceso actual (sin bifurcar)
+    try:
+        os.execve(python_in_venv, [python_in_venv] + sys.argv, env)
+    except AttributeError:
+        # Windows a veces no tiene os.execve disponible en algunas builds
+        import subprocess as _sp
+        result = _sp.run([python_in_venv] + sys.argv, env=env)
+        sys.exit(result.returncode)
+
+
+_bootstrap_venv()
+
+# ─────────────────────────────────────────────────────────────
+# A partir de aquí ya estamos DENTRO del venv
+# ─────────────────────────────────────────────────────────────
+
 import time
 import glob
 import subprocess
@@ -924,8 +981,22 @@ def _pause() -> None:
     input("\nPresiona Enter para continuar...")
 
 
+def _venv_info() -> str:
+    in_venv = sys.prefix != sys.base_prefix
+    if not in_venv:
+        return "NO (sistema)"
+    venv_path = sys.prefix
+    # Mostrar ruta relativa si está junto al script
+    try:
+        rel = os.path.relpath(venv_path, os.path.dirname(os.path.abspath(__file__)))
+        return f"sí ({rel})"
+    except ValueError:
+        return f"sí ({venv_path})"
+
+
 def _print_sysinfo() -> None:
-    print(f"\nSistema: {platform.system()} {platform.release()} | Python {sys.version.split()[0]}")
+    print(f"\nSistema : {platform.system()} {platform.release()} | Python {sys.version.split()[0]}")
+    print(f"Venv    : {_venv_info()}")
     print(f"Pantalla: {'disponible' if HAS_DISPLAY else 'NO detectada (modo headless)'}")
 
 

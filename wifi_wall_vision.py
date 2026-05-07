@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-WiFi-Wall-Vision v15 - Automatización completa con visualización gráfica
-- Instala y configura pyrtlsdr + DLLs automáticamente.
-- Escaneo de potencia WiFi (RTL-SDR).
-- Gráfica de barras del espectro tras el escaneo (requiere matplotlib).
+WiFi-Wall-Vision v16 - Compatible Windows y Linux
+- Detecta el SO y adapta todos los comandos automáticamente.
+- Instala y configura pyrtlsdr + DLLs en Windows.
+- Escaneo de potencia WiFi (RTL-SDR) con gráfica.
 - Captura CSI con HackRF (PicoScenes).
 - Modelo WiFiCam integrado (descarga automática).
 """
+
+from __future__ import annotations  # permite type hints en Python 3.9
 
 import sys
 import os
@@ -17,10 +19,28 @@ import urllib.request
 import shutil
 import zipfile
 import platform
+import importlib
 
-# ------------------------------------------------------------
-# Helpers de instalación dinámica
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# Constantes de plataforma
+# ─────────────────────────────────────────────────────────────
+
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX   = platform.system() == "Linux"
+IS_MACOS   = platform.system() == "Darwin"
+
+# ¿Hay entorno gráfico disponible?
+def _has_display() -> bool:
+    if IS_WINDOWS or IS_MACOS:
+        return True
+    # Linux: verificar variable DISPLAY o WAYLAND_DISPLAY
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+HAS_DISPLAY = _has_display()
+
+# ─────────────────────────────────────────────────────────────
+# Instalación dinámica de paquetes
+# ─────────────────────────────────────────────────────────────
 
 def _pip_install(pip_name: str) -> bool:
     try:
@@ -36,8 +56,6 @@ def _pip_install(pip_name: str) -> bool:
 
 
 def _import(module_path: str):
-    """Importa un módulo por su ruta completa (p.ej. 'matplotlib.pyplot')."""
-    import importlib
     try:
         return importlib.import_module(module_path)
     except ImportError:
@@ -48,11 +66,7 @@ def _import(module_path: str):
 
 
 def ensure_package(pip_name: str, module_path: str | None = None):
-    """
-    Garantiza que un paquete está disponible.
-    Pregunta al usuario antes de instalar.
-    Devuelve el módulo importado o None.
-    """
+    """Importa un módulo, preguntando al usuario para instalarlo si no existe."""
     if module_path is None:
         module_path = pip_name
 
@@ -61,29 +75,27 @@ def ensure_package(pip_name: str, module_path: str | None = None):
         return mod
 
     print(f"\n⚠️  El módulo '{pip_name}' no está instalado.")
-    resp = input(f"   ¿Quieres instalarlo ahora? [S/n]: ").strip().lower()
+    resp = input(f"   ¿Instalarlo ahora? [S/n]: ").strip().lower()
     if resp not in ("", "s", "si", "y", "yes"):
-        print("   Omitido. Las funciones relacionadas no estarán disponibles.")
+        print("   Omitido.")
         return None
 
     print(f"   Instalando {pip_name}...")
     if _pip_install(pip_name):
         mod = _import(module_path)
         if mod is not None:
-            print(f"   ✅ {pip_name} instalado correctamente.")
+            print(f"   ✅ {pip_name} instalado.")
             return mod
         print(f"   ❌ No se pudo importar {pip_name} tras instalarlo.")
     return None
 
 
-# ------------------------------------------------------------
-# Configuración de DLLs en Windows (RTL-SDR)
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# RTL-SDR: DLLs en Windows / udev en Linux
+# ─────────────────────────────────────────────────────────────
 
-def ensure_rtlsdr_dlls() -> bool:
-    if platform.system() != "Windows":
-        return True
-
+def _ensure_rtlsdr_dlls_windows() -> bool:
+    """Descarga las DLL de RTL-SDR en Windows si no están presentes."""
     dll_names = ["rtlsdr.dll", "libusb-1.0.dll"]
     if all(os.path.exists(d) for d in dll_names):
         try:
@@ -92,56 +104,95 @@ def ensure_rtlsdr_dlls() -> bool:
             pass
         return True
 
-    print("🌐 Faltan las DLL de RTL-SDR. Descargándolas automáticamente...")
-    dll_url = (
+    print("🌐 Faltan DLL de RTL-SDR. Descargando...")
+    url = (
         "https://github.com/osmocom/rtl-sdr/releases/download/v0.6.0/"
         "rtl-sdr-0.6.0-win32.zip"
     )
     zip_path = "rtl-sdr-dlls.zip"
     try:
-        urllib.request.urlretrieve(dll_url, zip_path)
+        urllib.request.urlretrieve(url, zip_path)
         with zipfile.ZipFile(zip_path, "r") as z:
             for name in z.namelist():
                 if name.endswith(".dll"):
                     z.extract(name, ".")
         os.remove(zip_path)
         os.add_dll_directory(os.getcwd())
-        print("✅ DLLs instaladas correctamente.")
+        print("✅ DLLs instaladas.")
         return True
     except Exception as e:
         print(f"❌ Error al descargar DLLs: {e}")
         return False
 
 
+def _check_rtlsdr_linux() -> None:
+    """
+    En Linux, verifica que el módulo del kernel conflictivo esté bloqueado
+    y que las reglas udev estén instaladas, imprimiendo guía si no.
+    """
+    # Verificar si dvb_usb_rtl28xxu está cargado (bloquea el acceso como SDR)
+    try:
+        lsmod = subprocess.run(
+            ["lsmod"], capture_output=True, text=True, timeout=5
+        )
+        if "dvb_usb_rtl28xxu" in lsmod.stdout:
+            print("⚠️  El módulo 'dvb_usb_rtl28xxu' está cargado y puede bloquear el RTL-SDR.")
+            print("   Para bloquearlo permanentemente:")
+            print("   echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/rtlsdr.conf")
+            print("   sudo modprobe -r dvb_usb_rtl28xxu")
+    except Exception:
+        pass
+
+    # Verificar reglas udev
+    udev_paths = [
+        "/etc/udev/rules.d/rtl-sdr.rules",
+        "/lib/udev/rules.d/rtl-sdr.rules",
+        "/usr/lib/udev/rules.d/rtl-sdr.rules",
+    ]
+    if not any(os.path.exists(p) for p in udev_paths):
+        print("⚠️  Reglas udev de RTL-SDR no encontradas.")
+        print("   Instálalas con:  sudo apt install rtl-sdr")
+        print("   o manualmente:   https://github.com/osmocom/rtl-sdr")
+
+
 def _load_rtlsdr():
-    """Carga pyrtlsdr gestionando DLLs en Windows."""
-    if platform.system() == "Windows":
-        ensure_rtlsdr_dlls()
+    """Carga pyrtlsdr gestionando dependencias según el SO."""
+    if IS_WINDOWS:
+        _ensure_rtlsdr_dlls_windows()
+    elif IS_LINUX:
+        _check_rtlsdr_linux()
 
     mod = _import("rtlsdr")
     if mod is not None:
         return mod
 
     print("\n⚠️  El módulo 'pyrtlsdr' no está instalado.")
-    resp = input("   ¿Quieres instalarlo ahora? [S/n]: ").strip().lower()
+    resp = input("   ¿Instalarlo ahora? [S/n]: ").strip().lower()
     if resp not in ("", "s", "si", "y", "yes"):
         return None
 
     print("   Instalando pyrtlsdr...")
     if _pip_install("pyrtlsdr"):
-        if platform.system() == "Windows":
-            ensure_rtlsdr_dlls()
+        if IS_WINDOWS:
+            _ensure_rtlsdr_dlls_windows()
         mod = _import("rtlsdr")
         if mod is not None:
-            print("   ✅ pyrtlsdr instalado correctamente.")
+            print("   ✅ pyrtlsdr instalado.")
             return mod
-        print("   ❌ No se pudo importar pyrtlsdr tras instalarlo.")
+    print("   ❌ No se pudo importar pyrtlsdr.")
     return None
 
 
-# ------------------------------------------------------------
-# Importaciones opcionales (carga diferida)
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# Módulos opcionales con carga diferida
+# ─────────────────────────────────────────────────────────────
+
+_np      = None
+_cv2     = None
+_tqdm_fn = None  # tqdm.tqdm, no el módulo
+_plt     = None  # matplotlib.pyplot
+_rtlsdr  = None
+
 
 def _get_numpy():
     global _np
@@ -156,11 +207,12 @@ def _get_cv2():
     return _cv2
 
 def _get_tqdm():
-    global _tqdm
-    if _tqdm is None:
+    global _tqdm_fn
+    if _tqdm_fn is None:
         mod = ensure_package("tqdm")
-        _tqdm = mod.tqdm if mod is not None else None
-    return _tqdm
+        if mod is not None:
+            _tqdm_fn = mod.tqdm
+    return _tqdm_fn
 
 def _get_plt():
     global _plt
@@ -174,16 +226,79 @@ def _get_rtlsdr():
         _rtlsdr = _load_rtlsdr()
     return _rtlsdr
 
-_np = None
-_cv2 = None
-_tqdm = None
-_plt = None
-_rtlsdr = None
+
+# ─────────────────────────────────────────────────────────────
+# Utilidades de sistema multiplataforma
+# ─────────────────────────────────────────────────────────────
+
+def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Ejecuta un comando, devolviendo siempre un CompletedProcess (nunca lanza)."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10, **kwargs)
+    except FileNotFoundError:
+        r = subprocess.CompletedProcess(cmd, returncode=127)
+        r.stdout = ""
+        r.stderr = f"Comando no encontrado: {cmd[0]}"
+        return r
+    except Exception as e:
+        r = subprocess.CompletedProcess(cmd, returncode=1)
+        r.stdout = ""
+        r.stderr = str(e)
+        return r
 
 
-# ------------------------------------------------------------
+def _open_file(path: str) -> None:
+    """Abre un archivo con el visor predeterminado del SO."""
+    try:
+        if IS_WINDOWS:
+            os.startfile(path)
+        elif IS_MACOS:
+            subprocess.Popen(["open", path])
+        else:
+            # Linux: intentar varios launchers
+            for launcher in ("xdg-open", "eog", "feh", "display"):
+                if shutil.which(launcher):
+                    subprocess.Popen([launcher, path])
+                    return
+            print(f"   (Abre manualmente el archivo: {path})")
+    except Exception as e:
+        print(f"   No se pudo abrir el visor: {e}")
+
+
+def _detect_wifi_interface_linux() -> str:
+    """Detecta la interfaz WiFi activa en Linux (no asume wlan0)."""
+    # Método 1: iw dev
+    r = _run(["iw", "dev"])
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Interface "):
+                return line.split()[-1]
+
+    # Método 2: ip link show type wireless (kernels modernos)
+    r = _run(["ip", "-o", "link", "show", "type", "ether"])
+    # no filtra por wireless, pero lo intentamos con /sys/class/net
+    try:
+        for iface_dir in glob.glob("/sys/class/net/*/wireless"):
+            iface = iface_dir.split("/")[4]
+            return iface
+    except Exception:
+        pass
+
+    # Fallback
+    return "wlan0"
+
+
+def _require_sudo_linux(cmd: list[str]) -> list[str]:
+    """En Linux añade sudo si el proceso no es root."""
+    if IS_LINUX and os.geteuid() != 0:
+        return ["sudo"] + cmd
+    return cmd
+
+
+# ─────────────────────────────────────────────────────────────
 # Detección de hardware
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
 
 def detect_rtlsdr() -> bool:
     rtlsdr = _get_rtlsdr()
@@ -191,35 +306,98 @@ def detect_rtlsdr() -> bool:
         return False
     try:
         sdr = rtlsdr.RtlSdr()
-        info = str(sdr.get_center_freq())  # operación mínima para verificar apertura
+        _ = sdr.get_center_freq()
         sdr.close()
         print("✅ RTL-SDR detectado y funcional.")
         return True
     except Exception as e:
         print(f"❌ No se pudo abrir el RTL-SDR: {e}")
-        print("   Asegúrate de que el dispositivo esté conectado y el driver correcto instalado.")
+        if IS_WINDOWS:
+            print("   Instala el driver WinUSB con Zadig: https://zadig.akeo.ie")
+        elif IS_LINUX:
+            _check_rtlsdr_linux()
         return False
 
 
 def detect_hackrf() -> bool:
-    try:
-        result = subprocess.run(
-            ["hackrf_info"], capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and "Found HackRF" in result.stdout:
-            print("✅ HackRF detectado.")
-            return True
-    except Exception:
-        pass
+    r = _run(["hackrf_info"])
+    if r.returncode == 0 and "Found HackRF" in r.stdout:
+        print("✅ HackRF detectado.")
+        return True
+    if r.returncode == 127:
+        print("ℹ️  hackrf_info no encontrado (HackRF no instalado o no en PATH).")
     return False
 
 
-# ------------------------------------------------------------
-# Escaneo de potencia WiFi + gráfica
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# Escaneo de redes WiFi cercanas
+# ─────────────────────────────────────────────────────────────
 
-# Canales 2.4 GHz estándar (1-13)
-_WIFI_CHANNELS = list(range(1, 14))
+def scan_nearby_wifi() -> None:
+    print("\n📡 Redes WiFi cercanas:\n")
+
+    if IS_WINDOWS:
+        r = _run(["netsh", "wlan", "show", "networks", "mode=bssid"])
+        print(r.stdout or r.stderr or "Sin resultados.")
+        return
+
+    if IS_MACOS:
+        airport = (
+            "/System/Library/PrivateFrameworks/Apple80211.framework"
+            "/Versions/Current/Resources/airport"
+        )
+        r = _run([airport, "-s"])
+        if r.returncode == 0:
+            print(r.stdout)
+            return
+        # macOS 14+: airport se eliminó, usar wdutil
+        r = _run(["wdutil", "info"])
+        print(r.stdout or r.stderr or "Sin resultados.")
+        return
+
+    # Linux: probar varios métodos en orden de preferencia
+    iface = _detect_wifi_interface_linux()
+
+    # 1. nmcli (NetworkManager, presente en la mayoría de distros de escritorio)
+    if shutil.which("nmcli"):
+        r = _run([
+            "nmcli", "-f", "SSID,BSSID,SIGNAL,CHAN,SECURITY",
+            "dev", "wifi", "list", "--rescan", "yes",
+        ])
+        if r.returncode == 0 and r.stdout.strip():
+            print(r.stdout)
+            return
+
+    # 2. iwlist (wireless-tools)
+    if shutil.which("iwlist"):
+        r = _run(_require_sudo_linux(["iwlist", iface, "scan"]))
+        if r.returncode == 0:
+            # Filtrar líneas relevantes para no saturar la pantalla
+            for line in r.stdout.splitlines():
+                stripped = line.strip()
+                if any(k in stripped for k in ("ESSID", "Address", "Signal", "Channel", "Encryption")):
+                    print(f"  {stripped}")
+            return
+
+    # 3. iw scan
+    if shutil.which("iw"):
+        r = _run(_require_sudo_linux(["iw", iface, "scan"]))
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                stripped = line.strip()
+                if any(k in stripped for k in ("SSID", "signal", "freq", "BSS ")):
+                    print(f"  {stripped}")
+            return
+
+    print("❌ No se encontró ninguna herramienta de escaneo WiFi.")
+    print("   Instala una de estas: nmcli (NetworkManager), iwlist (wireless-tools), iw")
+
+
+# ─────────────────────────────────────────────────────────────
+# Escaneo de potencia RTL-SDR + gráfica
+# ─────────────────────────────────────────────────────────────
+
+_WIFI_CHANNELS  = list(range(1, 14))
 _WIFI_FREQS_MHZ = [2412 + (ch - 1) * 5 for ch in _WIFI_CHANNELS]
 
 
@@ -253,14 +431,20 @@ def plot_power_scan(results: list) -> None:
         )
 
     fig.tight_layout()
-    fig.savefig("wifi_spectrum.png")
-    print("💾 Gráfica guardada como 'wifi_spectrum.png'")
-    plt.show()
+    out = "wifi_spectrum.png"
+    fig.savefig(out)
+    print(f"💾 Gráfica guardada como '{out}'")
+
+    if HAS_DISPLAY:
+        plt.show()
+    else:
+        print("   (Entorno sin pantalla: abre el archivo manualmente.)")
+        plt.close(fig)
 
 
-def wifi_power_scan_rtlsdr(duration: int = 10) -> list | None:
-    np = _get_numpy()
-    tqdm = _get_tqdm()
+def wifi_power_scan_rtlsdr() -> list | None:
+    np     = _get_numpy()
+    tqdm   = _get_tqdm()
     rtlsdr = _get_rtlsdr()
 
     if rtlsdr is None:
@@ -279,21 +463,19 @@ def wifi_power_scan_rtlsdr(duration: int = 10) -> list | None:
         return None
 
     print("📊 Escaneando canales WiFi 2.4 GHz...")
-    results = []
-    iterator = (
-        tqdm(zip(_WIFI_FREQS_MHZ, _WIFI_CHANNELS), total=len(_WIFI_CHANNELS), desc="Barriendo canales")
-        if tqdm is not None
-        else zip(_WIFI_FREQS_MHZ, _WIFI_CHANNELS)
-    )
+    results  = []
+    iterable = zip(_WIFI_FREQS_MHZ, _WIFI_CHANNELS)
+    if tqdm is not None:
+        iterable = tqdm(iterable, total=len(_WIFI_CHANNELS), desc="Barriendo canales")
 
     try:
-        for freq_mhz, ch in iterator:
+        for freq_mhz, ch in iterable:
             sdr.center_freq = freq_mhz * 1e6
             time.sleep(0.3)
-            samples = sdr.read_samples(256 * 1024)
-            power = np.mean(np.abs(samples) ** 2)
-            power_dbm = 10 * np.log10(power + 1e-12) - 30
-            results.append((ch, freq_mhz, power_dbm))
+            samples  = sdr.read_samples(256 * 1024)
+            power    = np.mean(np.abs(samples) ** 2)
+            power_db = 10 * np.log10(power + 1e-12) - 30
+            results.append((ch, freq_mhz, power_db))
     finally:
         sdr.close()
 
@@ -303,7 +485,7 @@ def wifi_power_scan_rtlsdr(duration: int = 10) -> list | None:
         print(f"  {ch:2}  |     {f:7.1f}      |   {p:6.1f}")
 
     csv_path = "wifi_power_scan.csv"
-    with open(csv_path, "w") as fp:
+    with open(csv_path, "w", encoding="utf-8") as fp:
         fp.write("Canal,Frecuencia_MHz,Potencia_dBm\n")
         for ch, f, p in results:
             fp.write(f"{ch},{f},{p:.2f}\n")
@@ -317,29 +499,56 @@ def wifi_power_scan_rtlsdr(duration: int = 10) -> list | None:
     return results
 
 
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
 # Captura CSI con HackRF (PicoScenes)
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+
+def _picoscenes_binary() -> str | None:
+    """Devuelve el nombre/ruta del binario PicoScenes según el SO."""
+    for name in ("PicoScenes", "picoscenes"):
+        if shutil.which(name):
+            return name
+    # Windows: buscar en rutas típicas de instalación
+    if IS_WINDOWS:
+        for candidate in [
+            r"C:\Program Files\PicoScenes\PicoScenes.exe",
+            r"C:\PicoScenes\PicoScenes.exe",
+        ]:
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
 
 def capture_csi_hackrf(duration: int = 10) -> str | None:
     tqdm = _get_tqdm()
+    ps   = _picoscenes_binary()
 
-    if not shutil.which("PicoScenes"):
-        print("❌ PicoScenes no instalado. Descárgalo de https://ps.zpj.io")
+    if ps is None:
+        print("❌ PicoScenes no encontrado.")
+        if IS_WINDOWS:
+            print("   Descárgalo de https://ps.zpj.io e instálalo.")
+        else:
+            print("   Instálalo desde https://ps.zpj.io o con:")
+            print("   sudo apt install picoscenes   (si está en tu repo)")
         return None
 
-    out_dir = "./csi_captures"
+    out_dir = os.path.join(os.getcwd(), "csi_captures")
     os.makedirs(out_dir, exist_ok=True)
 
     cmd = [
-        "PicoScenes", "-d", "debug",
+        ps, "-d", "debug",
         "-i", "hackrf0",
         "--mode", "logger",
         "--freq", "2447",
         "--rx-gain", "60",
+        "--output-dir", out_dir,
     ]
     print(f"📥 Grabando {duration}s de CSI con HackRF...")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"❌ No se pudo lanzar PicoScenes: {e}")
+        return None
 
     if tqdm is not None:
         for _ in tqdm(range(duration), desc="Capturando CSI", unit="s"):
@@ -347,7 +556,7 @@ def capture_csi_hackrf(duration: int = 10) -> str | None:
     else:
         for i in range(duration):
             time.sleep(1)
-            print(f"  {i+1}/{duration}s...", end="\r")
+            print(f"  {i+1}/{duration}s...", end="\r", flush=True)
         print()
 
     proc.terminate()
@@ -363,13 +572,20 @@ def capture_csi_hackrf(duration: int = 10) -> str | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────
+# Manejo de archivos CSI
+# ─────────────────────────────────────────────────────────────
+
 def filter_csi_files() -> list:
     candidates = []
     for ext in ("*.csi", "*.pcap", "*.npy"):
         candidates.extend(glob.glob(ext))
     for f in glob.glob("*.dat"):
-        if os.path.getsize(f) > 1_000_000:
-            candidates.append(f)
+        try:
+            if os.path.getsize(f) > 1_000_000:
+                candidates.append(f)
+        except OSError:
+            pass
     return sorted(set(candidates))
 
 
@@ -380,32 +596,32 @@ def load_csi_file(path: str):
 
     if path.endswith(".npy"):
         data = np.load(path)
-        # Normalizar a shape (frames, subcarriers, 2)
         if data.ndim == 2:
             data = data[:, :, np.newaxis]
             data = np.concatenate([np.abs(data), np.angle(data)], axis=-1)
         return data
 
-    try:
-        import importlib
-        csikit = importlib.import_module("CSIKit.reader")
-        reader = csikit.get_reader(path)
-        csi_data = reader.read_file(path)
-        frames = []
-        for frame in csi_data.frames:
-            mat = frame.csi_matrix[0, 0, :]
-            frames.append(np.stack([np.abs(mat), np.angle(mat)], axis=1))
-        return np.array(frames)
-    except ImportError:
-        pass  # CSIKit not available, fall back
+    # Intentar con CSIKit si está disponible
+    csikit = _import("CSIKit.reader")
+    if csikit is not None:
+        try:
+            reader = csikit.get_reader(path)
+            csi_data = reader.read_file(path)
+            frames = []
+            for frame in csi_data.frames:
+                mat = frame.csi_matrix[0, 0, :]
+                frames.append(np.stack([np.abs(mat), np.angle(mat)], axis=1))
+            return np.array(frames)
+        except Exception:
+            pass  # Fallback al método crudo
 
-    # Fallback: leer como complejo crudo
+    # Leer como complejo crudo
     raw = np.fromfile(path, dtype=np.complex64)
     if raw.size == 0:
-        raise ValueError("Archivo vacío o formato no soportado.")
-    n_sub = 30
+        raise ValueError(f"Archivo vacío o formato no soportado: {path}")
+    n_sub    = 30
     n_frames = raw.size // n_sub
-    raw = raw[: n_frames * n_sub].reshape(n_frames, n_sub)
+    raw      = raw[: n_frames * n_sub].reshape(n_frames, n_sub)
     return np.stack([np.abs(raw), np.angle(raw)], axis=-1)
 
 
@@ -420,20 +636,20 @@ def download_demo() -> str | None:
             "https://github.com/StrohmayerJ/wificam/raw/main/data/sample_csi.npy",
             dest,
         )
-        print("✅ Listo.")
+        print("✅ Descarga completa.")
         return dest
     except Exception as e:
         print(f"❌ Error al descargar el demo: {e}")
         return None
 
 
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
 # Modelo WiFiCam (VAE)
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
 
-_MODEL = None
-_DEVICE = None
-_N_SUB = 30   # subcarriers
+_MODEL   = None
+_DEVICE  = None
+_N_SUB   = 30
 _N_FRAMES = 200
 
 
@@ -441,8 +657,8 @@ def _build_wificam(torch, nn):
     class Encoder(nn.Module):
         def __init__(self, input_dim: int = _N_FRAMES * _N_SUB, latent_dim: int = 128):
             super().__init__()
-            self.fc1 = nn.Linear(input_dim, 512)
-            self.fc_mu = nn.Linear(512, latent_dim)
+            self.fc1      = nn.Linear(input_dim, 512)
+            self.fc_mu    = nn.Linear(512, latent_dim)
             self.fc_logvar = nn.Linear(512, latent_dim)
 
         def forward(self, x):
@@ -452,7 +668,7 @@ def _build_wificam(torch, nn):
     class Decoder(nn.Module):
         def __init__(self, latent_dim: int = 128):
             super().__init__()
-            self.fc = nn.Linear(latent_dim, 256)
+            self.fc     = nn.Linear(latent_dim, 256)
             self.deconv = nn.Sequential(
                 nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),
                 nn.ConvTranspose2d(128,  64, 4, 2, 1), nn.ReLU(),
@@ -462,8 +678,7 @@ def _build_wificam(torch, nn):
 
         def forward(self, z):
             h = torch.relu(self.fc(z))
-            h = h.view(-1, 256, 1, 1)
-            return self.deconv(h)
+            return self.deconv(h.view(-1, 256, 1, 1))
 
     class WiFiCam(nn.Module):
         def __init__(self):
@@ -472,8 +687,7 @@ def _build_wificam(torch, nn):
             self.decoder = Decoder()
 
         def _reparam(self, mu, logvar):
-            std = torch.exp(0.5 * logvar)
-            return mu + std * torch.randn_like(std)
+            return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
 
         def forward(self, x):
             mu, logvar = self.encoder(x)
@@ -508,45 +722,40 @@ def get_model():
             return None, None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_wificam(torch, nn).to(device)
+    model  = _build_wificam(torch, nn).to(device)
 
     try:
         checkpoint = torch.load(model_path, map_location=device)
-        state = checkpoint.get("state_dict", checkpoint)
+        state      = checkpoint.get("state_dict", checkpoint)
         model.load_state_dict(state, strict=False)
     except Exception as e:
-        print(f"⚠️  No se pudo cargar el checkpoint exacto: {e}")
-        print("   Se usará el modelo con pesos aleatorios (resultado demostrativo).")
+        print(f"⚠️  Checkpoint parcial: {e}")
+        print("   Usando pesos aleatorios (resultado demostrativo).")
 
     model.eval()
-    _MODEL = model
+    _MODEL  = model
     _DEVICE = device
     print("✅ Modelo de IA listo.")
     return model, device
 
 
-def preprocess_csi(csi_array) -> object:
+def preprocess_csi(csi_array):
     np = _get_numpy()
     n_frames, n_sub = csi_array.shape[:2]
 
-    # Ajustar número de frames
     if n_frames > _N_FRAMES:
         idx = np.linspace(0, n_frames - 1, _N_FRAMES, dtype=int)
         csi_array = csi_array[idx]
     elif n_frames < _N_FRAMES:
-        pad = _N_FRAMES - n_frames
-        csi_array = np.pad(csi_array, ((0, pad), (0, 0), (0, 0)), mode="edge")
+        csi_array = np.pad(csi_array, ((0, _N_FRAMES - n_frames), (0, 0), (0, 0)), mode="edge")
 
-    # Ajustar número de subcarriers
     if n_sub > _N_SUB:
         idx = np.linspace(0, n_sub - 1, _N_SUB, dtype=int)
         csi_array = csi_array[:, idx, :]
     elif n_sub < _N_SUB:
-        pad = _N_SUB - n_sub
-        csi_array = np.pad(csi_array, ((0, 0), (0, pad), (0, 0)), mode="edge")
+        csi_array = np.pad(csi_array, ((0, 0), (0, _N_SUB - n_sub), (0, 0)), mode="edge")
 
-    # Normalizar amplitud al rango [0, 1]
-    amp = csi_array[:, :, 0]
+    amp = csi_array[:, :, 0].astype(float)
     a_min, a_max = amp.min(), amp.max()
     if a_max > a_min:
         csi_array = csi_array.copy().astype(float)
@@ -555,49 +764,94 @@ def preprocess_csi(csi_array) -> object:
     return csi_array
 
 
-def generate_image(model, csi_array, device) -> object:
+def generate_image(model, csi_array, device):
     import torch
-
     np = _get_numpy()
-    # Usar solo la amplitud: shape (N_FRAMES, N_SUB) → aplanar a vector
+
     amp = csi_array[:, :, 0].astype(float)
-    x = torch.tensor(amp.flatten(), dtype=torch.float32).unsqueeze(0).to(device)
+    x   = torch.tensor(amp.flatten(), dtype=torch.float32).unsqueeze(0).to(device)
 
     with torch.no_grad():
         img_tensor, _, _ = model(x)
 
     img = img_tensor.squeeze().cpu().numpy()
-    img = (img * 255).clip(0, 255).astype(np.uint8)
-    return img
+    return (img * 255).clip(0, 255).astype(np.uint8)
 
 
-# ------------------------------------------------------------
+def _save_and_show_image(img, out_path: str) -> None:
+    """Guarda la imagen y la muestra con el método disponible."""
+    cv2 = _get_cv2()
+    plt = _get_plt()
+
+    saved = False
+
+    if cv2 is not None:
+        cv2.imwrite(out_path, img)
+        saved = True
+        if HAS_DISPLAY:
+            try:
+                cv2.imshow("WiFi-Wall-Vision", img)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+                return
+            except Exception:
+                pass  # cv2 sin GUI (headless OpenCV)
+
+    if plt is not None:
+        plt.imsave(out_path, img, cmap="gray")
+        saved = True
+        if HAS_DISPLAY:
+            fig, ax = plt.subplots()
+            ax.imshow(img, cmap="gray")
+            ax.set_title("WiFi-Wall-Vision")
+            ax.axis("off")
+            plt.show()
+            return
+
+    if saved:
+        print(f"💾 Imagen guardada: {out_path}")
+        if not HAS_DISPLAY:
+            print("   (Entorno sin pantalla. Abriendo con visor del sistema...)")
+            _open_file(out_path)
+    else:
+        print("❌ Ni OpenCV ni matplotlib están disponibles para guardar la imagen.")
+
+
+# ─────────────────────────────────────────────────────────────
 # Menú principal
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
 
-def _pause():
+def _pause() -> None:
     input("\nPresiona Enter para continuar...")
 
 
-def main():
+def _print_sysinfo() -> None:
+    print(f"\nSistema: {platform.system()} {platform.release()} | Python {sys.version.split()[0]}")
+    print(f"Pantalla: {'disponible' if HAS_DISPLAY else 'NO detectada (modo headless)'}")
+
+
+def main() -> None:
+    _print_sysinfo()
     has_rtlsdr = detect_rtlsdr()
     has_hackrf = detect_hackrf()
-    csi_data = None
+    csi_data   = None
 
     while True:
-        print("\n" + "=" * 60)
-        print("       WiFi-Wall-Vision  –  Menú Principal")
-        print("=" * 60)
-        rtlsdr_tag = "" if has_rtlsdr else " [no disponible]"
-        hackrf_tag = "" if has_hackrf else " [no disponible]"
-        print("[1] Re-escanear dispositivos SDR")
-        print("[2] Mostrar redes WiFi cercanas")
-        print(f"[3] Escaneo de potencia WiFi (RTL-SDR){rtlsdr_tag}")
-        print(f"[4] Capturar CSI con HackRF{hackrf_tag}")
-        print("[5] Cargar archivo CSI del disco")
-        print("[6] Descargar dataset demo")
-        print("[7] Generar imagen con IA")
-        print("[8] Salir")
+        print("\n" + "=" * 62)
+        print("        WiFi-Wall-Vision  –  Menú Principal")
+        print(f"        SO: {platform.system()}  |  Pantalla: {'Sí' if HAS_DISPLAY else 'No'}")
+        print("=" * 62)
+        r_tag = "" if has_rtlsdr else "  [sin dispositivo]"
+        h_tag = "" if has_hackrf else "  [sin dispositivo]"
+        d_tag = f"  ({csi_data.shape[0]} frames cargados)" if csi_data is not None else "  [sin datos]"
+        print(f"[1] Re-escanear dispositivos SDR")
+        print(f"[2] Mostrar redes WiFi cercanas")
+        print(f"[3] Escaneo de potencia WiFi RTL-SDR{r_tag}")
+        print(f"[4] Capturar CSI con HackRF{h_tag}")
+        print(f"[5] Cargar archivo CSI del disco")
+        print(f"[6] Descargar dataset demo")
+        print(f"[7] Generar imagen con IA{d_tag}")
+        print(f"[8] Salir")
         op = input("Opción: ").strip()
 
         if op == "1":
@@ -606,27 +860,12 @@ def main():
             _pause()
 
         elif op == "2":
-            print("\n📡 Redes WiFi cercanas:")
-            if os.name == "nt":
-                subprocess.run(["netsh", "wlan", "show", "networks", "mode=bssid"])
-            else:
-                iface = "wlan0"
-                result = subprocess.run(
-                    ["sudo", "iwlist", iface, "scan"],
-                    capture_output=True, text=True,
-                )
-                if result.returncode != 0:
-                    # Intentar con nmcli como alternativa
-                    result = subprocess.run(
-                        ["nmcli", "-f", "SSID,BSSID,SIGNAL,CHAN,SECURITY", "dev", "wifi"],
-                        capture_output=True, text=True,
-                    )
-                print(result.stdout or result.stderr or "Sin resultados.")
+            scan_nearby_wifi()
             _pause()
 
         elif op == "3":
             if not has_rtlsdr:
-                print("⚠️  RTL-SDR no disponible. Usa '[1] Re-escanear' primero.")
+                print("⚠️  RTL-SDR no disponible. Conecta el dispositivo y usa [1] para re-escanear.")
             else:
                 wifi_power_scan_rtlsdr()
             _pause()
@@ -639,31 +878,35 @@ def main():
                 if path:
                     try:
                         csi_data = load_csi_file(path)
-                        print(f"✅ Datos CSI cargados: {csi_data.shape}")
+                        print(f"✅ CSI cargado: {csi_data.shape}")
                     except Exception as e:
-                        print(f"❌ Error al cargar: {e}")
+                        print(f"❌ Error al cargar CSI: {e}")
             _pause()
 
         elif op == "5":
             files = filter_csi_files()
             if not files:
-                print("No se encontraron archivos CSI (.csi, .pcap, .npy, .dat) en la carpeta actual.")
-                print("Usa la opción [6] para descargar el dataset demo.")
+                print("No se encontraron archivos CSI en la carpeta actual.")
+                print("Extensiones buscadas: .csi  .pcap  .npy  .dat (>1 MB)")
+                print("Usa [6] para descargar el dataset demo.")
             else:
                 print("\nArchivos disponibles:")
                 for i, f in enumerate(files):
-                    size_mb = os.path.getsize(f) / 1e6
+                    try:
+                        size_mb = os.path.getsize(f) / 1e6
+                    except OSError:
+                        size_mb = 0
                     print(f"  [{i}] {f}  ({size_mb:.1f} MB)")
                 print("  [D] Descargar y usar demo")
                 sel = input("Selecciona: ").strip().lower()
                 if sel == "d":
                     path = download_demo()
                     if path:
-                        np = _get_numpy()
-                        csi_data = np.load(path)
-                        if csi_data.ndim == 2:
-                            csi_data = csi_data[:, :, np.newaxis]
-                        print(f"✅ Demo cargado: {csi_data.shape}")
+                        try:
+                            csi_data = load_csi_file(path)
+                            print(f"✅ Demo cargado: {csi_data.shape}")
+                        except Exception as e:
+                            print(f"❌ Error: {e}")
                 elif sel.isdigit():
                     idx = int(sel)
                     if 0 <= idx < len(files):
@@ -681,13 +924,11 @@ def main():
         elif op == "6":
             path = download_demo()
             if path:
-                np = _get_numpy()
-                raw = np.load(path)
-                if raw.ndim == 2:
-                    raw = raw[:, :, np.newaxis]
-                    raw = np.concatenate([np.abs(raw), np.angle(raw)], axis=-1)
-                csi_data = raw
-                print(f"✅ Dataset demo cargado: {csi_data.shape}")
+                try:
+                    csi_data = load_csi_file(path)
+                    print(f"✅ Dataset demo cargado: {csi_data.shape}")
+                except Exception as e:
+                    print(f"❌ Error al cargar demo: {e}")
             _pause()
 
         elif op == "7":
@@ -700,28 +941,10 @@ def main():
                 else:
                     print("🎨 Preprocesando y generando imagen...")
                     try:
-                        prep = preprocess_csi(csi_data)
-                        img = generate_image(model, prep, device)
+                        prep     = preprocess_csi(csi_data)
+                        img      = generate_image(model, prep, device)
                         out_path = "vista_traves_pared.png"
-                        cv2 = _get_cv2()
-                        if cv2 is not None:
-                            cv2.imwrite(out_path, img)
-                            print(f"💾 Imagen guardada: {out_path}")
-                            cv2.imshow("Resultado WiFi-Wall-Vision", img)
-                            cv2.waitKey(0)
-                            cv2.destroyAllWindows()
-                        else:
-                            # Fallback: guardar con matplotlib
-                            plt = _get_plt()
-                            if plt is not None:
-                                plt.imsave(out_path, img, cmap="gray")
-                                print(f"💾 Imagen guardada: {out_path}")
-                                plt.imshow(img, cmap="gray")
-                                plt.title("Resultado WiFi-Wall-Vision")
-                                plt.axis("off")
-                                plt.show()
-                            else:
-                                print("❌ Ni OpenCV ni matplotlib disponibles para mostrar la imagen.")
+                        _save_and_show_image(img, out_path)
                     except Exception as e:
                         print(f"❌ Error al generar imagen: {e}")
             _pause()

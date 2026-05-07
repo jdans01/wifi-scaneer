@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-WiFi-Wall-Vision v18 - Compatible Windows y Linux, venv + Python automático
-- En Windows con Python 3.13+: descarga e instala Python 3.12 automáticamente.
-- Se autovirtualiza en .venv (recrea si la versión de Python cambia).
-- Detecta el SO y adapta todos los comandos automáticamente.
-- Instala y configura pyrtlsdr + DLLs en Windows.
-- Escaneo de potencia WiFi (RTL-SDR) con gráfica.
-- Captura CSI con HackRF (PicoScenes).
-- Modelo WiFiCam integrado (descarga automática).
+WiFi-Wall-Vision v19 - 100% automático, sin preguntas
+- Detecta Python 3.13+ en Windows → instala Python 3.12 automáticamente.
+- Crea y activa .venv automáticamente.
+- Instala todos los paquetes necesarios sin intervención.
+- Configura DLLs de RTL-SDR con selección correcta de arquitectura (x64/x32).
 """
 
 from __future__ import annotations
@@ -17,25 +14,26 @@ import os
 import subprocess
 import urllib.request
 import shutil
+import struct
 
 # ─────────────────────────────────────────────────────────────
-# Constantes de versión objetivo
+# Arquitectura del proceso Python actual
 # ─────────────────────────────────────────────────────────────
+_IS_64BIT = struct.calcsize("P") == 8
 
-# pyrtlsdr requiere Python <= 3.12 (sin wheel para 3.13+)
-_NEED_PY_MAX  = (3, 12)
-_TARGET_PY    = "3.12.10"   # versión a instalar si hace falta
+# pyrtlsdr solo tiene wheel para Python ≤ 3.12
+_NEED_PY_MAX = (3, 12)
+_TARGET_PY   = "3.12.10"
 _TARGET_PY_URL = (
     f"https://www.python.org/ftp/python/{_TARGET_PY}/"
-    f"python-{_TARGET_PY}-amd64.exe"
+    f"python-{_TARGET_PY}-{'amd64' if _IS_64BIT else 'win32'}.exe"
 )
 
 # ─────────────────────────────────────────────────────────────
-# Gestión automática de versión Python (solo Windows, solo si hace falta)
+# Helper: relanzar proceso
 # ─────────────────────────────────────────────────────────────
 
 def _reexec(python_exe: str, extra_env: dict | None = None) -> None:
-    """Reemplaza el proceso actual con python_exe ejecutando este mismo script."""
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
@@ -45,15 +43,17 @@ def _reexec(python_exe: str, extra_env: dict | None = None) -> None:
         result = subprocess.run([python_exe] + sys.argv, env=env)
         sys.exit(result.returncode)
 
+# ─────────────────────────────────────────────────────────────
+# Gestión de versión Python (automática, sin preguntas)
+# ─────────────────────────────────────────────────────────────
 
 def _venv_python_version(venv_dir: str) -> tuple[int, int] | None:
-    """Lee la versión de Python del pyvenv.cfg del venv."""
     cfg = os.path.join(venv_dir, "pyvenv.cfg")
     try:
         with open(cfg, encoding="utf-8") as f:
             for line in f:
                 if line.strip().startswith("version"):
-                    ver = line.split("=", 1)[1].strip()   # "3.14.3"
+                    ver = line.split("=", 1)[1].strip()
                     parts = ver.split(".")
                     return (int(parts[0]), int(parts[1]))
     except Exception:
@@ -62,12 +62,8 @@ def _venv_python_version(venv_dir: str) -> tuple[int, int] | None:
 
 
 def _find_compatible_python() -> str | None:
-    """
-    Busca Python 3.11 o 3.12 ya instalado en Windows.
-    Prueba el Python Launcher (py.exe) y rutas comunes de instalación.
-    """
+    """Busca Python 3.12 o 3.11 ya instalado en el sistema."""
     for minor in (12, 11):
-        # Python Launcher para Windows (viene con Python >= 3.3)
         try:
             r = subprocess.run(
                 ["py", f"-3.{minor}", "-c", "import sys; print(sys.executable)"],
@@ -80,196 +76,147 @@ def _find_compatible_python() -> str | None:
         except Exception:
             pass
 
-        # Rutas típicas de instalación manual y Microsoft Store
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
-        candidates = [
-            os.path.join(local_app, "Programs", "Python", f"Python3{minor}", "python.exe"),
-            os.path.join(local_app, "Programs", "Python", f"Python{3}{minor}", "python.exe"),
+        local  = os.environ.get("LOCALAPPDATA", "")
+        pf     = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+        for path in [
+            os.path.join(local, "Programs", "Python", f"Python3{minor}", "python.exe"),
             rf"C:\Python3{minor}\python.exe",
-            os.path.join(program_files, f"Python 3.{minor}", "python.exe"),
-            os.path.join(program_files, f"Python3{minor}", "python.exe"),
-        ]
-        for path in candidates:
+            os.path.join(pf, f"Python3{minor}", "python.exe"),
+        ]:
             if os.path.isfile(path):
                 return path
-
     return None
 
 
 def _install_python_312() -> str | None:
-    """
-    Descarga e instala Python 3.12 silenciosamente para el usuario actual.
-    No requiere permisos de administrador (InstallAllUsers=0).
-    Devuelve la ruta al python.exe instalado, o None si falló.
-    """
+    """Descarga e instala Python 3.12 para el usuario actual (sin admin)."""
     import tempfile
 
-    local_app  = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    target_dir = os.path.join(local_app, "Programs", "Python", "Python312")
-    exe_path   = os.path.join(target_dir, "python.exe")
+    local     = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    dest_dir  = os.path.join(local, "Programs", "Python", "Python312")
+    exe_path  = os.path.join(dest_dir, "python.exe")
 
     if os.path.isfile(exe_path):
-        return exe_path   # ya instalado por una ejecución anterior
+        return exe_path
 
-    print(f"\n🌐 Descargando Python {_TARGET_PY} (~25 MB)...")
-    print(f"   Fuente: {_TARGET_PY_URL}")
-
-    tmp_fd, tmp_installer = tempfile.mkstemp(suffix=".exe", prefix="py_installer_")
+    print(f"\n⚙️  Descargando Python {_TARGET_PY} (~25 MB)...")
+    tmp_fd, tmp = tempfile.mkstemp(suffix=".exe", prefix="py_")
     os.close(tmp_fd)
-
     try:
-        def _progress(count, block, total):
+        def _prog(n, blk, total):
             if total > 0:
-                pct = min(100, count * block * 100 // total)
-                print(f"\r   {pct}% descargado...", end="", flush=True)
-
-        urllib.request.urlretrieve(_TARGET_PY_URL, tmp_installer, _progress)
-        print()   # nueva línea tras la barra de progreso
+                print(f"\r   {min(100, n*blk*100//total)}%...", end="", flush=True)
+        urllib.request.urlretrieve(_TARGET_PY_URL, tmp, _prog)
+        print()
     except Exception as e:
-        print(f"\n   ❌ Error al descargar: {e}")
-        try:
-            os.remove(tmp_installer)
-        except OSError:
-            pass
+        print(f"\n   ❌ Descarga fallida: {e}")
+        os.remove(tmp)
         return None
 
-    print(f"🔧 Instalando Python {_TARGET_PY} en: {target_dir}")
-    print("   (instalación silenciosa de usuario, sin privilegios de administrador)")
+    print(f"⚙️  Instalando Python {_TARGET_PY} (usuario, sin admin)...")
     try:
-        result = subprocess.run(
-            [
-                tmp_installer,
-                "/quiet",
-                "InstallAllUsers=0",
-                "PrependPath=0",        # no modificar PATH del sistema
-                "Include_launcher=0",   # no instalar py.exe de nuevo
-                f"TargetDir={target_dir}",
-            ],
+        r = subprocess.run(
+            [tmp, "/quiet", "InstallAllUsers=0", "PrependPath=0",
+             "Include_launcher=0", f"TargetDir={dest_dir}"],
             timeout=300,
         )
     except Exception as e:
-        print(f"   ❌ Error durante la instalación: {e}")
+        print(f"   ❌ Instalación fallida: {e}")
         return None
     finally:
         try:
-            os.remove(tmp_installer)
+            os.remove(tmp)
         except OSError:
             pass
 
-    if result.returncode != 0:
-        print(f"   ❌ El instalador salió con código {result.returncode}.")
-        print("   Instala Python 3.12 manualmente: https://www.python.org/downloads/")
+    if r.returncode != 0:
+        print(f"   ❌ Instalador salió con código {r.returncode}")
         return None
 
     if os.path.isfile(exe_path):
         print(f"   ✅ Python {_TARGET_PY} instalado.")
         return exe_path
-
-    print("   ❌ No se encontró python.exe tras la instalación.")
+    print("   ❌ No se encontró python.exe tras instalar.")
     return None
 
 
 def _ensure_compatible_python_windows() -> None:
-    """
-    En Windows con Python >= 3.13:
-      1. Busca Python 3.11/3.12 ya instalado.
-      2. Si no existe, descarga e instala Python 3.12.
-      3. Re-ejecuta este script con la versión compatible.
-    """
+    """En Windows con Python 3.13+: cambia a Python 3.12 automáticamente."""
     if sys.platform != "win32":
         return
-    # Comparar solo major.minor (sys.version_info es una tupla larga, ej. (3,12,10,'final',0))
     if (sys.version_info.major, sys.version_info.minor) <= _NEED_PY_MAX:
         return
     if os.environ.get("_WIFIVISION_PYTHON_OK") == "1":
-        # Ya pasamos por aquí; seguimos aunque la versión no sea ideal
         return
 
-    print(f"\n⚠️  Python {sys.version_info.major}.{sys.version_info.minor} detectado.")
-    print(f"   pyrtlsdr (RTL-SDR) solo tiene wheels para Python ≤ 3.12.")
-    print("   Buscando Python 3.12 en el sistema...")
+    print(f"\n⚙️  Python {sys.version_info.major}.{sys.version_info.minor} detectado."
+          f" RTL-SDR necesita Python 3.12.")
 
     py_exec = _find_compatible_python()
-
     if py_exec:
-        print(f"   ✅ Encontrado: {py_exec}")
+        print(f"   ✅ Python 3.12 encontrado: {py_exec}")
     else:
-        print("   No encontrado.")
-        resp = input(f"   ¿Instalar Python {_TARGET_PY} automáticamente? [S/n]: ").strip().lower()
-        if resp not in ("", "s", "si", "y", "yes"):
-            print("   Omitido — pyrtlsdr no estará disponible.")
-            os.environ["_WIFIVISION_PYTHON_OK"] = "1"
-            return
+        print("   Instalando Python 3.12 automáticamente...")
         py_exec = _install_python_312()
 
     if py_exec is None:
-        print("   ❌ No se pudo obtener Python 3.12. Continuando con la versión actual.")
+        print("   ❌ No se pudo obtener Python 3.12. RTL-SDR no estará disponible.")
         os.environ["_WIFIVISION_PYTHON_OK"] = "1"
         return
 
-    # Borrar el venv creado con Python 3.14 para que se recree con 3.12
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    venv_dir   = os.path.join(script_dir, ".venv")
+    # Eliminar venv antiguo si fue creado con otra versión
+    venv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv")
     if os.path.isdir(venv_dir):
-        venv_ver = _venv_python_version(venv_dir)
-        cur_ver  = (sys.version_info.major, sys.version_info.minor)
-        if venv_ver and venv_ver != cur_ver:
-            print(f"   ♻️  Eliminando venv de Python {venv_ver[0]}.{venv_ver[1]} para recrearlo con 3.12...")
+        vv = _venv_python_version(venv_dir)
+        cv = (sys.version_info.major, sys.version_info.minor)
+        if vv and vv != cv:
+            print(f"   ♻️  Eliminando venv Python {vv[0]}.{vv[1]} para recrear con 3.12...")
             shutil.rmtree(venv_dir, ignore_errors=True)
 
-    print(f"🚀 Relanzando con Python {_TARGET_PY[:4]}...")
+    print(f"🚀 Relanzando con Python 3.12...")
     _reexec(py_exec, {"_WIFIVISION_PYTHON_OK": "1", "_WIFIVISION_VENV_ACTIVE": ""})
 
 
 _ensure_compatible_python_windows()
 
 # ─────────────────────────────────────────────────────────────
-# Bootstrap de entorno virtual
+# Bootstrap de entorno virtual (automático)
 # ─────────────────────────────────────────────────────────────
 
 def _bootstrap_venv() -> None:
-    """
-    Crea y activa .venv/ junto al script si no estamos ya dentro de un venv.
-    Si el venv existente fue creado con una versión distinta de Python, lo recrea.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     venv_dir   = os.path.join(script_dir, ".venv")
     _win       = sys.platform == "win32"
+    py_in_venv = os.path.join(venv_dir,
+                               "Scripts" if _win else "bin",
+                               "python.exe" if _win else "python")
 
-    python_in_venv = os.path.join(
-        venv_dir,
-        "Scripts" if _win else "bin",
-        "python.exe" if _win else "python",
-    )
-
-    # Ya dentro del venv correcto → nada que hacer
     if sys.prefix != sys.base_prefix:
-        venv_ver = _venv_python_version(venv_dir)
-        cur_ver  = (sys.version_info.major, sys.version_info.minor)
-        if venv_ver and venv_ver == cur_ver:
+        # Ya dentro de un venv — verificar que la versión coincide
+        vv = _venv_python_version(venv_dir)
+        cv = (sys.version_info.major, sys.version_info.minor)
+        if not vv or vv == cv:
             return
-        # Versión distinta → recrear (puede pasar si el usuario cambió Python)
-        print(f"♻️  Venv de Python {venv_ver} detectado; recreando con Python {cur_ver}...")
+        print(f"♻️  Venv Python {vv} ≠ Python {cv}. Recreando...")
         shutil.rmtree(venv_dir, ignore_errors=True)
 
     if os.environ.get("_WIFIVISION_VENV_ACTIVE") == "1":
         return
 
-    if not os.path.isfile(python_in_venv):
-        print("🔧 Creando entorno virtual en .venv/ ...")
-        import venv as _venv_mod
-        _venv_mod.create(venv_dir, with_pip=True, clear=True)
-        print("✅ Entorno virtual creado.")
+    if not os.path.isfile(py_in_venv):
+        print("⚙️  Creando entorno virtual (.venv)...")
+        import venv as _vm
+        _vm.create(venv_dir, with_pip=True, clear=True)
+        print("   ✅ Entorno virtual creado.")
 
-    print("🚀 Relanzando dentro del entorno virtual...")
-    _reexec(python_in_venv, {"_WIFIVISION_VENV_ACTIVE": "1"})
+    print("🚀 Activando entorno virtual...")
+    _reexec(py_in_venv, {"_WIFIVISION_VENV_ACTIVE": "1"})
 
 
 _bootstrap_venv()
 
 # ─────────────────────────────────────────────────────────────
-# A partir de aquí: dentro del venv con la versión correcta de Python
+# A partir de aquí: venv activo con Python correcto
 # ─────────────────────────────────────────────────────────────
 
 import time
@@ -299,38 +246,25 @@ HAS_DISPLAY = _has_display()
 # Instalación dinámica de paquetes
 # ─────────────────────────────────────────────────────────────
 
-def _pip_install(pip_name: str, show_output: bool = False) -> bool:
-    """Instala un paquete con pip. show_output=True muestra stderr si falla."""
-    try:
-        kwargs: dict = {}
-        if not show_output:
-            kwargs["stdout"] = subprocess.DEVNULL
-            kwargs["stderr"] = subprocess.PIPE
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", pip_name],
-            **kwargs,
-        )
-        if result.returncode != 0:
-            if not show_output and result.stderr:
-                # Mostrar solo la última línea de error (suele ser la relevante)
-                last = result.stderr.decode(errors="replace").strip().splitlines()
-                if last:
-                    print(f"   pip: {last[-1]}")
-            return False
-        return True
-    except Exception as e:
-        print(f"   ❌ Error al instalar {pip_name}: {e}")
-        return False
+# ─────────────────────────────────────────────────────────────
+# Instalación automática de paquetes (sin preguntas)
+# ─────────────────────────────────────────────────────────────
+
+def _pip_install(pip_name: str) -> bool:
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet",
+         "--disable-pip-version-check", pip_name],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        last = (result.stderr or result.stdout or b"").decode(errors="replace").strip().splitlines()
+        if last:
+            print(f"   pip error: {last[-1]}")
+    return result.returncode == 0
 
 
 def _invalidate_import_cache(module_name: str) -> None:
-    """
-    Limpia el caché de importación para que Python redescubra un módulo
-    recién instalado con pip sin necesidad de reiniciar el intérprete.
-    """
-    # Eliminar entradas negativas (módulos que no se encontraron antes)
     sys.modules.pop(module_name, None)
-    # Refrescar los finders (PathFinder reconstruye sys.path_importer_cache)
     importlib.invalidate_caches()
 
 
@@ -339,13 +273,12 @@ def _import(module_path: str):
         return importlib.import_module(module_path)
     except ImportError:
         return None
-    except Exception as e:
-        print(f"⚠️  No se pudo importar {module_path}: {e}")
+    except Exception:
         return None
 
 
 def ensure_package(pip_name: str, module_path: str | None = None):
-    """Importa un módulo, preguntando al usuario para instalarlo si no existe."""
+    """Importa un módulo; lo instala automáticamente si no existe."""
     if module_path is None:
         module_path = pip_name
 
@@ -353,20 +286,14 @@ def ensure_package(pip_name: str, module_path: str | None = None):
     if mod is not None:
         return mod
 
-    print(f"\n⚠️  El módulo '{pip_name}' no está instalado.")
-    resp = input(f"   ¿Instalarlo ahora? [S/n]: ").strip().lower()
-    if resp not in ("", "s", "si", "y", "yes"):
-        print("   Omitido.")
-        return None
-
-    print(f"   Instalando {pip_name}...")
-    if _pip_install(pip_name, show_output=True):
+    print(f"⚙️  Instalando {pip_name}...")
+    if _pip_install(pip_name):
         _invalidate_import_cache(module_path.split(".")[0])
         mod = _import(module_path)
         if mod is not None:
-            print(f"   ✅ {pip_name} instalado.")
+            print(f"   ✅ {pip_name} listo.")
             return mod
-        print(f"   ❌ No se pudo importar {pip_name} tras instalarlo.")
+    print(f"   ❌ No se pudo instalar {pip_name}.")
     return None
 
 
@@ -374,8 +301,12 @@ def ensure_package(pip_name: str, module_path: str | None = None):
 # RTL-SDR: DLLs en Windows / udev en Linux
 # ─────────────────────────────────────────────────────────────
 
+def _scripts_dir() -> str:
+    """Directorio de python.exe del venv activo (siempre está en PATH)."""
+    return os.path.dirname(sys.executable)
+
+
 def _register_dll_dir(directory: str) -> None:
-    """Registra un directorio de DLLs en Windows (os.add_dll_directory + PATH)."""
     abs_dir = os.path.abspath(directory)
     try:
         os.add_dll_directory(abs_dir)
@@ -384,98 +315,46 @@ def _register_dll_dir(directory: str) -> None:
     os.environ["PATH"] = abs_dir + os.pathsep + os.environ.get("PATH", "")
 
 
-def _python_scripts_dir() -> str:
-    """Devuelve el directorio Scripts/ (Windows) del Python activo."""
-    return os.path.join(os.path.dirname(sys.executable))
+def _copy_dlls_to_scripts(src_dir: str) -> None:
+    """Copia las DLLs al directorio de python.exe (garantiza que estén en PATH)."""
+    dst = _scripts_dir()
+    for fname in os.listdir(src_dir):
+        if fname.lower().endswith(".dll"):
+            try:
+                shutil.copy2(os.path.join(src_dir, fname),
+                             os.path.join(dst, fname))
+            except Exception:
+                pass
 
 
-def _copy_dlls_to_scripts(dll_dir: str) -> None:
-    """
-    Copia las DLLs al directorio de python.exe del venv.
-    Es la ubicación más fiable en Windows: siempre está en PATH
-    y Python carga extensiones .pyd desde ahí sin necesitar add_dll_directory.
-    """
-    scripts = _python_scripts_dir()
+def _dll_loadable() -> bool:
+    """Verifica si rtlsdr.dll es cargable con ctypes."""
+    import ctypes
+    # Intentar con nombre simple (busca en PATH + add_dll_directory)
     try:
-        for fname in os.listdir(dll_dir):
-            if fname.lower().endswith(".dll"):
-                src = os.path.join(dll_dir, fname)
-                dst = os.path.join(scripts, fname)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-    except Exception:
+        ctypes.CDLL("rtlsdr")
+        return True
+    except OSError:
         pass
-
-
-def _check_python_version_rtlsdr() -> None:
-    """
-    pyrtlsdr publica wheels hasta Python 3.12.
-    En Python 3.13+ no hay wheel precompilado; pip intentará compilar desde
-    código C, lo que requiere Visual Studio Build Tools y puede fallar.
-    Avisamos al usuario con la solución concreta.
-    """
-    major, minor = sys.version_info.major, sys.version_info.minor
-    if major == 3 and minor >= 13:
-        print(f"\n⚠️  Python {major}.{minor} detectado.")
-        print("   pyrtlsdr no tiene wheel para Python 3.13+.")
-        print("   Para evitar errores de compilación, instala Python 3.11 o 3.12:")
-        print("   https://www.python.org/downloads/")
-        print("   Luego vuelve a ejecutar este script con esa versión.")
-        print("   (Continuando de todas formas — puede que funcione si tienes")
-        print("    Visual Studio Build Tools instalado)")
-
-
-def _find_dll_in_known_dirs() -> str | None:
-    """
-    Busca rtlsdr.dll en:
-    - site-packages del venv activo
-    - directorio del script
-    - directorio Scripts/ del venv
-    """
-    search_dirs: list[str] = []
-
-    # site-packages
-    try:
-        import site
+    # Intentar con ruta completa en Scripts/
+    full = os.path.join(_scripts_dir(), "rtlsdr.dll")
+    if os.path.isfile(full):
         try:
-            search_dirs += site.getsitepackages()
-        except Exception:
+            ctypes.CDLL(full)
+            return True
+        except OSError:
             pass
-        try:
-            search_dirs.append(site.getusersitepackages())
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # Directorio del script y Scripts/ del venv
-    search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
-    search_dirs.append(_python_scripts_dir())
-
-    # También ./rtlsdr_dlls/ si existe
-    local_dlls = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
-    if os.path.isdir(local_dlls):
-        search_dirs.append(local_dlls)
-
-    for root in search_dirs:
-        if not os.path.isdir(root):
-            continue
-        for dirpath, _, filenames in os.walk(root):
-            lower = [f.lower() for f in filenames]
-            if "rtlsdr.dll" in lower:
-                return dirpath
-
-    return None
+    return False
 
 
 def _download_rtlsdr_dlls() -> str | None:
     """
-    Descarga las DLLs de RTL-SDR desde GitHub Releases.
-    Usa tempfile para el zip (sin problemas de permisos en CWD).
-    Extrae en <script_dir>/rtlsdr_dlls/ y también copia a Scripts/.
+    Descarga el zip de RTL-SDR, extrae solo las DLLs de la arquitectura
+    correcta (x64 para Python 64-bit, x32 para 32-bit) y las copia a Scripts/.
     """
     import tempfile
 
+    arch_hint = "x64" if _IS_64BIT else "x32"
     mirrors = [
         "https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest/download/Release.zip",
         "https://github.com/osmocom/rtl-sdr/releases/latest/download/rtl-sdr-win64.zip",
@@ -484,91 +363,70 @@ def _download_rtlsdr_dlls() -> str | None:
     dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
     os.makedirs(dll_dir, exist_ok=True)
 
-    print("🌐 Descargando DLLs de RTL-SDR...")
+    # Si ya tenemos la DLL en dll_dir de una descarga anterior, usarla
+    if os.path.isfile(os.path.join(dll_dir, "rtlsdr.dll")):
+        return dll_dir
+
+    print("⚙️  Descargando DLLs de RTL-SDR...")
     for url in mirrors:
-        host = url.split("/")[2]
-        repo = "/".join(url.split("/")[3:5])
-        print(f"   → {host}/{repo} ...")
+        host = "/".join(url.split("/")[2:5])
+        print(f"   → {host} ...")
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="rtlsdr_")
         os.close(tmp_fd)
         try:
             urllib.request.urlretrieve(url, tmp_path)
             with zipfile.ZipFile(tmp_path, "r") as z:
-                dll_entries = [n for n in z.namelist() if n.lower().endswith(".dll")]
-                if not dll_entries:
-                    print("   ✗ El zip no contiene DLLs.")
+                all_dlls = [n for n in z.namelist() if n.lower().endswith(".dll")]
+                # Preferir DLLs en subcarpeta x64/ (o x32/)
+                arch_dlls = [n for n in all_dlls if f"/{arch_hint}/" in n.lower() or
+                             n.lower().startswith(arch_hint + "/")]
+                chosen = arch_dlls if arch_dlls else all_dlls
+                if not chosen:
+                    print("   ✗ zip sin DLLs.")
                     continue
-                for entry in dll_entries:
+                for entry in chosen:
                     data = z.read(entry)
                     dest = os.path.join(dll_dir, os.path.basename(entry))
                     with open(dest, "wb") as f:
                         f.write(data)
-            print(f"   ✅ DLLs descargadas en: {dll_dir}")
-            # Copiar también al Scripts/ del venv (máxima compatibilidad)
             _copy_dlls_to_scripts(dll_dir)
+            _register_dll_dir(dll_dir)
+            print(f"   ✅ DLLs ({arch_hint}) listas.")
             return dll_dir
         except Exception as e:
-            print(f"   ✗ Falló: {e}")
+            print(f"   ✗ {e}")
         finally:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-
     return None
 
 
 def _ensure_rtlsdr_dlls_windows() -> bool:
-    """
-    Garantiza que rtlsdr.dll es cargable en Windows.
-    Estrategia:
-      1. ctypes ya puede cargarla (en PATH).
-      2. Buscar en site-packages / Scripts / rtlsdr_dlls → registrar.
-      3. Descargar de GitHub Releases → copiar a Scripts/.
-      4. Instrucciones manuales.
-    """
-    import ctypes
-
-    # ── 1. Ya cargable ────────────────────────────────────────────────────
-    try:
-        ctypes.CDLL("rtlsdr")
+    """Garantiza que rtlsdr.dll es cargable. Totalmente automático."""
+    if _dll_loadable():
         return True
-    except OSError:
-        pass
 
-    # ── 2. Buscar en ubicaciones conocidas ────────────────────────────────
-    found_dir = _find_dll_in_known_dirs()
-    if found_dir:
-        _register_dll_dir(found_dir)
-        _copy_dlls_to_scripts(found_dir)
-        try:
-            ctypes.CDLL("rtlsdr")
-            return True
-        except OSError:
-            pass  # continuar a descarga
+    # Buscar en dll_dir local o Scripts/
+    for search_dir in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls"),
+        _scripts_dir(),
+    ]:
+        if os.path.isfile(os.path.join(search_dir, "rtlsdr.dll")):
+            _register_dll_dir(search_dir)
+            _copy_dlls_to_scripts(search_dir)
+            if _dll_loadable():
+                return True
 
-    # ── 3. Descargar ──────────────────────────────────────────────────────
+    # Descargar
     dll_dir = _download_rtlsdr_dlls()
-    if dll_dir:
-        _register_dll_dir(dll_dir)
-        try:
-            ctypes.CDLL("rtlsdr")
-            return True
-        except OSError:
-            pass  # DLL descargada pero aún no cargable (raro)
+    if dll_dir and _dll_loadable():
+        return True
 
-    # ── 4. Instrucciones manuales ─────────────────────────────────────────
-    scripts = _python_scripts_dir()
-    print("\n❌ No se pudo preparar rtlsdr.dll automáticamente.")
-    print(f"   Copia manualmente rtlsdr.dll y libusb-1.0.dll a:")
-    print(f"   {scripts}")
-    print()
-    print("   Descarga las DLLs de:")
-    print("   https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest")
-    print("   (archivo Release.zip → carpeta x64/)")
-    print()
-    print("   También necesitas el driver USB:")
-    print("   https://zadig.akeo.ie  →  RTL-SDR → WinUSB")
+    print(f"\n   ⚠️  rtlsdr.dll no cargable. Copia manualmente a: {_scripts_dir()}")
+    print("   Descarga: https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest")
+    print("   Driver USB: https://zadig.akeo.ie  →  RTL-SDR → WinUSB")
     return False
 
 
@@ -602,99 +460,57 @@ def _check_rtlsdr_linux() -> None:
         print("   o manualmente:   https://github.com/osmocom/rtl-sdr")
 
 
-def _subprocess_can_import(module: str) -> bool:
-    """
-    Verifica si un módulo es importable lanzando un proceso Python limpio.
-    Esto evita el problema del caché de importación del proceso actual
-    y confirma si el paquete está realmente disponible en disco.
-    """
-    result = subprocess.run(
-        [sys.executable, "-c", f"import {module}"],
-        capture_output=True,
-        timeout=15,
-    )
-    return result.returncode == 0
-
-
 def _load_rtlsdr():
-    """Carga pyrtlsdr en Windows/Linux con gestión completa de DLLs."""
+    """Carga pyrtlsdr automáticamente (sin preguntas)."""
     if IS_LINUX:
         _check_rtlsdr_linux()
 
-    # ── Paso 1: preparar DLLs en Windows antes del primer intento ────────
+    # Asegurar DLLs antes del primer import (Windows)
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
 
-    # ── Paso 2: intentar importar en el proceso actual ────────────────────
     _invalidate_import_cache("rtlsdr")
+
+    # Primer intento de import
     try:
-        mod = importlib.import_module("rtlsdr")
-        return mod
+        return importlib.import_module("rtlsdr")
     except ImportError:
-        pass  # no instalado → continuar
-    except OSError as e:
-        # Instalado pero DLL no encontrada
-        print(f"\n⚠️  pyrtlsdr instalado pero falta una DLL: {e}")
+        pass
+    except OSError:
+        # Instalado pero DLL no encontrada: reintentar con DLLs
         if IS_WINDOWS:
             _ensure_rtlsdr_dlls_windows()
             _invalidate_import_cache("rtlsdr")
             try:
-                mod = importlib.import_module("rtlsdr")
-                print("   ✅ pyrtlsdr cargado.")
-                return mod
-            except Exception as e2:
-                print(f"   ❌ Sigue fallando: {e2}")
+                return importlib.import_module("rtlsdr")
+            except Exception:
+                pass
         return None
-    except Exception as e:
-        print(f"⚠️  Error inesperado al importar rtlsdr: {e}")
+    except Exception:
         return None
 
-    # ── Paso 3: instalar ──────────────────────────────────────────────────
-    if IS_WINDOWS:
-        _check_python_version_rtlsdr()
-
-    print("\n⚠️  El módulo 'pyrtlsdr' no está instalado.")
-    resp = input("   ¿Instalarlo ahora? [S/n]: ").strip().lower()
-    if resp not in ("", "s", "si", "y", "yes"):
-        return None
-
-    print("   Instalando pyrtlsdr...")
-    ok = _pip_install("pyrtlsdr", show_output=True)
-    if not ok:
-        print("   ❌ pip no pudo instalar pyrtlsdr.")
-        if IS_WINDOWS and sys.version_info >= (3, 13):
-            print("   Causa probable: no hay wheel para Python 3.13+.")
-            print("   Solución: usa Python 3.11 o 3.12.")
-            print("   Descarga: https://www.python.org/downloads/")
-        return None
-
-    # ── Paso 4: verificar con proceso limpio (sin caché de este proceso) ──
-    if not _subprocess_can_import("rtlsdr"):
-        # pip dijo OK pero el módulo no es importable → C extension sin compilar
-        print("   ⚠️  pyrtlsdr instalado pero no es importable.")
-        if IS_WINDOWS and sys.version_info >= (3, 13):
-            print("   No hay wheel precompilado para Python 3.13+.")
-            print("   ► Instala Python 3.11 o 3.12 y vuelve a ejecutar el script.")
-            print("     https://www.python.org/downloads/")
+    # Instalar automáticamente
+    print("⚙️  Instalando pyrtlsdr...")
+    if not _pip_install("pyrtlsdr"):
+        # Verificar si es problema de Python 3.13+
+        ver = (sys.version_info.major, sys.version_info.minor)
+        if IS_WINDOWS and ver > (3, 12):
+            print(f"   ❌ No hay wheel de pyrtlsdr para Python {ver[0]}.{ver[1]}.")
+            print("   Reinicia el script; instalará Python 3.12 automáticamente.")
         else:
-            print("   Revisa el error con:  pip install pyrtlsdr  (sin --quiet)")
+            print("   ❌ pip falló al instalar pyrtlsdr.")
         return None
 
-    # ── Paso 5: registrar DLLs y cargar en el proceso actual ─────────────
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
 
     _invalidate_import_cache("rtlsdr")
     try:
         mod = importlib.import_module("rtlsdr")
-        print("   ✅ pyrtlsdr instalado y cargado.")
+        print("   ✅ pyrtlsdr listo.")
         return mod
-    except OSError as e:
-        print(f"   ❌ DLL no encontrada al importar: {e}")
-        print(f"   Copia rtlsdr.dll a: {_python_scripts_dir()}")
-        return None
     except Exception as e:
-        print(f"   ❌ Error al importar: {e}")
+        print(f"   ❌ pyrtlsdr instalado pero no cargable: {e}")
         return None
 
 

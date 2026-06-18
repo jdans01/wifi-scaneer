@@ -358,40 +358,38 @@ def _copy_dlls_to_scripts(src_dir: str) -> None:
             except Exception:
                 pass
 
-    # Crear alias bidireccional rtlsdr.dll / librtlsdr.dll
-    pairs = [
-        ("rtlsdr.dll",    "librtlsdr.dll"),
-        ("librtlsdr.dll", "rtlsdr.dll"),
-    ]
-    for src_name, alias_name in pairs:
-        src  = os.path.join(dst, src_name)
-        alias = os.path.join(dst, alias_name)
-        if os.path.isfile(src) and not os.path.isfile(alias):
-            try:
-                shutil.copy2(src, alias)
-            except Exception:
-                pass
+    # Crear/actualizar alias rtlsdr.dll -> librtlsdr.dll (siempre se sobrescribe
+    # para no dejar un alias desactualizado tras una nueva descarga)
+    src = os.path.join(dst, "rtlsdr.dll")
+    alias = os.path.join(dst, "librtlsdr.dll")
+    if os.path.isfile(src):
+        try:
+            shutil.copy2(src, alias)
+        except Exception:
+            pass
+
+
+def _dll_has_v4_support(path: str) -> bool:
+    """
+    Verifica que la DLL exporte rtlsdr_set_dithering, función presente solo
+    en el fork de rtlsdrblog (necesaria para RTL-SDR v4 con tuner R828D).
+    El driver clásico de osmocom no la tiene y falla al usarse con v4.
+    """
+    import ctypes
+    try:
+        lib = ctypes.CDLL(path)
+        return hasattr(lib, "rtlsdr_set_dithering")
+    except OSError:
+        return False
 
 
 def _dll_loadable() -> bool:
-    """Verifica si rtlsdr/librtlsdr es cargable con ctypes."""
-    import ctypes
+    """Verifica si rtlsdr/librtlsdr es cargable con ctypes y soporta v4."""
     scripts = _scripts_dir()
     for name in ("rtlsdr", "librtlsdr"):
-        # Por nombre simple (PATH / add_dll_directory)
-        try:
-            ctypes.CDLL(name)
-            return True
-        except OSError:
-            pass
-        # Por ruta completa en Scripts/
         full = os.path.join(scripts, f"{name}.dll")
-        if os.path.isfile(full):
-            try:
-                ctypes.CDLL(full)
-                return True
-            except OSError:
-                pass
+        if os.path.isfile(full) and _dll_has_v4_support(full):
+            return True
     return False
 
 
@@ -403,17 +401,23 @@ def _download_rtlsdr_dlls() -> str | None:
     import tempfile
 
     arch_hint = "x64" if _IS_64BIT else "x32"
+    # Solo el fork de rtlsdrblog soporta RTL-SDR v4 (función rtlsdr_set_dithering).
+    # El driver clásico de osmocom NO sirve para v4, así que no se usa como mirror.
     mirrors = [
         "https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest/download/Release.zip",
-        "https://github.com/osmocom/rtl-sdr/releases/latest/download/rtl-sdr-win64.zip",
     ]
 
     dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
     os.makedirs(dll_dir, exist_ok=True)
 
-    # Si ya tenemos la DLL en dll_dir de una descarga anterior, usarla
-    if os.path.isfile(os.path.join(dll_dir, "rtlsdr.dll")):
-        return dll_dir
+    cached = os.path.join(dll_dir, "rtlsdr.dll")
+    if os.path.isfile(cached):
+        if _dll_has_v4_support(cached):
+            return dll_dir
+        # DLL antigua cacheada (sin soporte v4) de un intento previo: descartarla
+        print("   ♻️  DLL cacheada sin soporte RTL-SDR v4, descargando de nuevo...")
+        shutil.rmtree(dll_dir, ignore_errors=True)
+        os.makedirs(dll_dir, exist_ok=True)
 
     print("⚙️  Descargando DLLs de RTL-SDR...")
     for url in mirrors:
@@ -437,9 +441,15 @@ def _download_rtlsdr_dlls() -> str | None:
                     dest = os.path.join(dll_dir, os.path.basename(entry))
                     with open(dest, "wb") as f:
                         f.write(data)
+
+            extracted = os.path.join(dll_dir, "rtlsdr.dll")
+            if not os.path.isfile(extracted) or not _dll_has_v4_support(extracted):
+                print("   ✗ DLL extraída no soporta RTL-SDR v4, probando siguiente mirror...")
+                continue
+
             _copy_dlls_to_scripts(dll_dir)
             _register_dll_dir(dll_dir)
-            print(f"   ✅ DLLs ({arch_hint}) listas.")
+            print(f"   ✅ DLLs ({arch_hint}) listas, con soporte RTL-SDR v4.")
             return dll_dir
         except Exception as e:
             print(f"   ✗ {e}")
@@ -543,10 +553,16 @@ def _load_rtlsdr():
         return importlib.import_module("rtlsdr")
     except ImportError:
         pass
-    except OSError:
-        # Instalado pero DLL no encontrada: reintentar con DLLs
+    except (OSError, AttributeError) as e:
+        # DLL no encontrada, o cargada pero sin soporte v4
+        # (AttributeError: "function 'rtlsdr_set_dithering' not found").
         if IS_WINDOWS:
+            if "rtlsdr_set_dithering" in str(e):
+                print("   ⚠️  DLL sin soporte RTL-SDR v4 detectada, forzando redescarga...")
+                dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
+                shutil.rmtree(dll_dir, ignore_errors=True)
             _ensure_rtlsdr_dlls_windows()
+            _preload_rtlsdr_deps()
             _invalidate_import_cache("rtlsdr")
             try:
                 return importlib.import_module("rtlsdr")
@@ -570,12 +586,30 @@ def _load_rtlsdr():
 
     if IS_WINDOWS:
         _ensure_rtlsdr_dlls_windows()
+        _preload_rtlsdr_deps()
 
     _invalidate_import_cache("rtlsdr")
     try:
         mod = importlib.import_module("rtlsdr")
         print("   ✅ pyrtlsdr listo.")
         return mod
+    except (OSError, AttributeError) as e:
+        if IS_WINDOWS and "rtlsdr_set_dithering" in str(e):
+            print("   ⚠️  DLL sin soporte RTL-SDR v4 detectada, forzando redescarga...")
+            dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
+            shutil.rmtree(dll_dir, ignore_errors=True)
+            _ensure_rtlsdr_dlls_windows()
+            _preload_rtlsdr_deps()
+            _invalidate_import_cache("rtlsdr")
+            try:
+                mod = importlib.import_module("rtlsdr")
+                print("   ✅ pyrtlsdr listo.")
+                return mod
+            except Exception as e2:
+                print(f"   ❌ pyrtlsdr instalado pero no cargable: {e2}")
+                return None
+        print(f"   ❌ pyrtlsdr instalado pero no cargable: {e}")
+        return None
     except Exception as e:
         print(f"   ❌ pyrtlsdr instalado pero no cargable: {e}")
         return None

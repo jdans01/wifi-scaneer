@@ -374,11 +374,21 @@ def _dll_has_v4_support(path: str) -> bool:
     Verifica que la DLL exporte rtlsdr_set_dithering, función presente solo
     en el fork de rtlsdrblog (necesaria para RTL-SDR v4 con tuner R828D).
     El driver clásico de osmocom no la tiene y falla al usarse con v4.
+
+    Libera la librería explícitamente tras la verificación: si no se hace,
+    Windows mantiene el archivo bloqueado en este proceso, lo que impide
+    borrarlo/sobrescribirlo más adelante si resulta ser una versión vieja.
     """
     import ctypes
     try:
         lib = ctypes.CDLL(path)
-        return hasattr(lib, "rtlsdr_set_dithering")
+        has_symbol = hasattr(lib, "rtlsdr_set_dithering")
+        if IS_WINDOWS:
+            try:
+                ctypes.windll.kernel32.FreeLibrary(lib._handle)
+            except Exception:
+                pass
+        return has_symbol
     except OSError:
         return False
 

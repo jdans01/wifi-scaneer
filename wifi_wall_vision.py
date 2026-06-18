@@ -1277,16 +1277,30 @@ def download_demo() -> str | None:
     if os.path.exists(dest):
         print(f"✅ Usando demo existente: {dest}")
         return dest
-    print("🌐 Descargando dataset demo...")
+
+    np = _get_numpy()
+    if np is None:
+        print("❌ numpy no está disponible, no se puede generar el demo.")
+        return None
+
+    print(
+        "ℹ️  El dataset real de wificam no se distribuye desde GitHub, sino "
+        "como archivo completo en Zenodo:\n"
+        "    https://zenodo.org/records/11554280\n"
+        "    (descárgalo manualmente y colócalo en este directorio si lo necesitas).\n"
+        "🌐 Generando un CSI de demostración sintético para probar el pipeline..."
+    )
     try:
-        urllib.request.urlretrieve(
-            "https://github.com/StrohmayerJ/wificam/raw/main/data/sample_csi.npy",
-            dest,
-        )
-        print("✅ Descarga completa.")
+        rng = np.random.default_rng(0)
+        n_frames, n_sub = 200, 30
+        amp = np.abs(rng.normal(loc=1.0, scale=0.2, size=(n_frames, n_sub)))
+        phase = rng.uniform(-np.pi, np.pi, size=(n_frames, n_sub))
+        csi_array = np.stack([amp, phase], axis=-1)
+        np.save(dest, csi_array)
+        print(f"✅ Demo sintético generado: {dest}")
         return dest
     except Exception as e:
-        print(f"❌ Error al descargar el demo: {e}")
+        print(f"❌ Error al generar el demo: {e}")
         return None
 
 
@@ -1357,27 +1371,25 @@ def get_model():
 
     model_path = "wificam_model.pt"
     if not os.path.exists(model_path):
-        print("🌐 Descargando modelo WiFiCam (~154 MB)...")
-        try:
-            urllib.request.urlretrieve(
-                "https://github.com/StrohmayerJ/wificam/releases/download/v1.0/model.pt",
-                model_path,
-            )
-            print("✅ Modelo descargado.")
-        except Exception as e:
-            print(f"❌ Error al descargar el modelo: {e}")
-            return None, None
+        print(
+            "ℹ️  El proyecto wificam no publica pesos pre-entrenados: hay que "
+            "entrenar el modelo propio (ver instrucciones en su README) y "
+            "colocar el checkpoint resultante como 'wificam_model.pt' en este "
+            "directorio.\n"
+            "   Continuando con pesos aleatorios (resultado demostrativo, sin entrenar)."
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = _build_wificam(torch, nn).to(device)
 
-    try:
-        checkpoint = torch.load(model_path, map_location=device)
-        state      = checkpoint.get("state_dict", checkpoint)
-        model.load_state_dict(state, strict=False)
-    except Exception as e:
-        print(f"⚠️  Checkpoint parcial: {e}")
-        print("   Usando pesos aleatorios (resultado demostrativo).")
+    if os.path.exists(model_path):
+        try:
+            checkpoint = torch.load(model_path, map_location=device)
+            state      = checkpoint.get("state_dict", checkpoint)
+            model.load_state_dict(state, strict=False)
+        except Exception as e:
+            print(f"⚠️  Checkpoint parcial: {e}")
+            print("   Usando pesos aleatorios (resultado demostrativo).")
 
     model.eval()
     _MODEL  = model

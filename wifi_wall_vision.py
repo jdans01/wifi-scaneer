@@ -1018,6 +1018,67 @@ def wifi_power_scan_rtlsdr() -> list | None:
     return results
 
 
+def capture_csi_rtlsdr(duration: int = 10, channel: int = 6, n_sub: int = 30) -> str | None:
+    """
+    Captura "pseudo-CSI" con un RTL-SDR (incluye RTL-SDR v4): no extrae CSI
+    real de tramas 802.11 (el RTL-SDR no puede decodificar WiFi), pero
+    construye una matriz tiempo x frecuencia vía FFT del espectro capturado
+    en el canal WiFi elegido. Sirve como entrada aproximada al mismo
+    pipeline de IA que usa CSI real (PicoScenes/HackRF).
+    """
+    np     = _get_numpy()
+    tqdm   = _get_tqdm()
+    rtlsdr = _get_rtlsdr()
+
+    if rtlsdr is None:
+        print("❌ pyrtlsdr no disponible.")
+        return None
+    if np is None:
+        print("❌ numpy no disponible.")
+        return None
+
+    if channel not in _WIFI_CHANNELS:
+        channel = 6
+    freq_mhz = _WIFI_FREQS_MHZ[_WIFI_CHANNELS.index(channel)]
+
+    try:
+        sdr = rtlsdr.RtlSdr()
+        sdr.sample_rate  = 2.4e6
+        sdr.center_freq  = freq_mhz * 1e6
+        sdr.gain         = "auto"
+    except Exception as e:
+        print(f"❌ No se pudo abrir el RTL-SDR: {e}")
+        return None
+
+    chunk_size = 4096
+    n_frames   = max(1, int(duration * sdr.sample_rate / chunk_size))
+
+    print(f"📥 Grabando {duration}s de pseudo-CSI (canal {channel}, {freq_mhz} MHz) con RTL-SDR...")
+    frames = []
+    try:
+        iterable = range(n_frames)
+        if tqdm is not None:
+            iterable = tqdm(iterable, desc="Capturando pseudo-CSI", unit="frame")
+        for _ in iterable:
+            samples = sdr.read_samples(chunk_size)
+            spectrum = np.fft.fftshift(np.fft.fft(samples))
+            idx = np.linspace(0, len(spectrum) - 1, n_sub, dtype=int)
+            bins = spectrum[idx]
+            frames.append(np.stack([np.abs(bins), np.angle(bins)], axis=-1))
+    finally:
+        sdr.close()
+
+    csi_array = np.array(frames)  # (n_frames, n_sub, 2)
+
+    out_dir = os.path.join(os.getcwd(), "csi_captures")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"rtlsdr_pseudo_csi_ch{channel}_{int(time.time())}.npy")
+    np.save(out_path, csi_array)
+    print(f"✅ Captura guardada: {out_path}  (forma {csi_array.shape})")
+    print("   ⚠️  Esto es una aproximación espectral, no CSI 802.11 real.")
+    return out_path
+
+
 # ─────────────────────────────────────────────────────────────
 # Captura CSI con PicoScenes (cualquier NIC/SDR compatible,
 # no solo HackRF: Intel AX200/AX210, Atheros ath9k, USRP, etc.)
@@ -1064,26 +1125,6 @@ def detect_csi_interfaces(has_hackrf: bool) -> list[str]:
                 candidates.append("usrp0")
 
     return candidates
-
-
-def choose_csi_interface(has_hackrf: bool) -> str | None:
-    """Auto-selecciona la interfaz si solo hay una, o pregunta si hay varias."""
-    interfaces = detect_csi_interfaces(has_hackrf)
-    if not interfaces:
-        return None
-    if len(interfaces) == 1:
-        return interfaces[0]
-
-    print("\nSe detectaron varias interfaces compatibles con PicoScenes:")
-    for i, iface in enumerate(interfaces):
-        print(f"  [{i}] {iface}")
-    sel = input("Selecciona interfaz [0]: ").strip()
-    if not sel:
-        return interfaces[0]
-    if sel.isdigit() and 0 <= int(sel) < len(interfaces):
-        return interfaces[int(sel)]
-    print("Selección inválida, usando la primera.")
-    return interfaces[0]
 
 
 def capture_csi(interface: str, duration: int = 10) -> str | None:
@@ -1425,7 +1466,7 @@ def main() -> None:
         print("=" * 62)
         csi_interfaces = detect_csi_interfaces(has_hackrf)
         r_tag = "" if has_rtlsdr else "  [sin dispositivo]"
-        c_tag = "" if csi_interfaces else "  [sin dispositivo]"
+        c_tag = "" if (csi_interfaces or has_rtlsdr) else "  [sin dispositivo]"
         d_tag = f"  ({csi_data.shape[0]} frames cargados)" if csi_data is not None else "  [sin datos]"
         print(f"[1] Re-escanear dispositivos SDR")
         print(f"[2] Mostrar redes WiFi cercanas")
@@ -1455,13 +1496,30 @@ def main() -> None:
             _pause()
 
         elif op == "4":
-            if not csi_interfaces:
-                print("⚠️  No se detectó ninguna interfaz compatible con PicoScenes "
-                      "(HackRF, NIC WiFi soportada o USRP).")
+            sources = [("picoscenes", iface) for iface in csi_interfaces]
+            if has_rtlsdr:
+                sources.append(("rtlsdr", "rtlsdr (pseudo-CSI vía FFT, aproximado)"))
+
+            if not sources:
+                print("⚠️  No se detectó ninguna fuente para CSI "
+                      "(PicoScenes: HackRF/NIC WiFi/USRP, o un RTL-SDR conectado).")
                 print("   Usa [5] para una alternativa sin hardware especial.")
             else:
-                iface = choose_csi_interface(has_hackrf)
-                path  = capture_csi(iface)
+                if len(sources) == 1:
+                    kind, label = sources[0]
+                else:
+                    print("\nFuentes disponibles para captura CSI:")
+                    for i, (_, label) in enumerate(sources):
+                        print(f"  [{i}] {label}")
+                    sel = input("Selecciona [0]: ").strip()
+                    idx = int(sel) if sel.isdigit() and int(sel) < len(sources) else 0
+                    kind, label = sources[idx]
+
+                if kind == "rtlsdr":
+                    path = capture_csi_rtlsdr()
+                else:
+                    path = capture_csi(label)
+
                 if path:
                     try:
                         csi_data = load_csi_file(path)

@@ -792,6 +792,127 @@ def scan_nearby_wifi() -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# Modo sin hardware: visión aproximada solo con la tarjeta WiFi
+# normal (sin RTL-SDR, HackRF ni PicoScenes)
+# ─────────────────────────────────────────────────────────────
+
+def _scan_wifi_rssi() -> list[tuple[str, int]]:
+    """Devuelve (ssid, rssi_dbm) de las redes visibles, multiplataforma."""
+    results: list[tuple[str, int]] = []
+
+    if IS_WINDOWS:
+        r = _run(["netsh", "wlan", "show", "networks", "mode=Bssid"])
+        ssid = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("SSID"):
+                ssid = line.split(":", 1)[1].strip() or "(oculta)"
+            elif line.startswith("Signal") and ssid:
+                try:
+                    pct = int(line.split(":", 1)[1].strip().rstrip("%"))
+                    results.append((ssid, -100 + pct))
+                except ValueError:
+                    pass
+        return results
+
+    if IS_MACOS:
+        airport = (
+            "/System/Library/PrivateFrameworks/Apple80211.framework"
+            "/Versions/Current/Resources/airport"
+        )
+        r = _run([airport, "-s"])
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    results.append((parts[0], int(parts[2])))
+                except ValueError:
+                    pass
+        return results
+
+    # Linux
+    if shutil.which("nmcli"):
+        r = _run(["nmcli", "-t", "-f", "SSID,SIGNAL", "dev", "wifi", "list", "--rescan", "yes"])
+        for line in r.stdout.splitlines():
+            if ":" not in line:
+                continue
+            ssid, sig = line.rsplit(":", 1)
+            try:
+                pct = int(sig)
+                results.append((ssid or "(oculta)", -100 + pct))
+            except ValueError:
+                pass
+        if results:
+            return results
+
+    if shutil.which("iwlist"):
+        iface = _detect_wifi_interface_linux()
+        r = _run(_require_sudo_linux(["iwlist", iface, "scan"]))
+        ssid = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("ESSID"):
+                ssid = line.split(":", 1)[1].strip('"') or "(oculta)"
+            elif "Signal level" in line and ssid:
+                try:
+                    dbm = int(line.split("Signal level=")[1].split(" ")[0])
+                    results.append((ssid, dbm))
+                except (IndexError, ValueError):
+                    pass
+
+    return results
+
+
+def wifi_rssi_vision() -> None:
+    """
+    Genera una imagen aproximada de intensidad de señal WiFi usando
+    solo el adaptador WiFi normal (sin RTL-SDR/HackRF/PicoScenes).
+    Pide muestras en varias posiciones físicas y construye un mapa
+    simple de intensidad (no es CSI real, es una aproximación con RSSI).
+    """
+    np = _get_numpy()
+    if np is None:
+        print("❌ numpy no disponible.")
+        return
+
+    raw = input("¿Cuántas posiciones vas a muestrear? (mín. 2, recomendado 4-9) [4]: ").strip()
+    try:
+        n_pos = max(2, int(raw)) if raw else 4
+    except ValueError:
+        n_pos = 4
+
+    grid = int(np.ceil(np.sqrt(n_pos)))
+    samples: list[float] = []
+    networks_seen: set[str] = set()
+
+    for i in range(n_pos):
+        input(f"\n📍 Posición {i + 1}/{n_pos}: muévete al punto deseado y presiona Enter...")
+        readings = _scan_wifi_rssi()
+        if not readings:
+            print("   ⚠️  No se detectaron redes. Se usará -100 dBm.")
+            samples.append(-100.0)
+            continue
+        avg_dbm = sum(d for _, d in readings) / len(readings)
+        best_ssid, best_dbm = max(readings, key=lambda r: r[1])
+        networks_seen.update(s for s, _ in readings)
+        print(f"   📶 {len(readings)} redes vistas. Más fuerte: {best_ssid} ({best_dbm} dBm). "
+              f"Promedio: {avg_dbm:.1f} dBm")
+        samples.append(avg_dbm)
+
+    while len(samples) < grid * grid:
+        samples.append(min(samples))
+
+    arr  = np.array(samples[: grid * grid]).reshape(grid, grid)
+    rng  = arr.max() - arr.min()
+    norm = (arr - arr.min()) / rng if rng > 0 else np.zeros_like(arr)
+    img  = (norm * 255).astype(np.uint8)
+
+    print(f"\n✅ Mapa de {grid}x{grid} construido a partir de {len(networks_seen)} redes detectadas.")
+    print("   (Esto es una aproximación basada en RSSI, no una imagen CSI real.)")
+    _save_and_show_image(img, "wifi_rssi_vision.png")
+
+
+# ─────────────────────────────────────────────────────────────
 # Escaneo de potencia RTL-SDR + gráfica
 # ─────────────────────────────────────────────────────────────
 
@@ -898,7 +1019,8 @@ def wifi_power_scan_rtlsdr() -> list | None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Captura CSI con HackRF (PicoScenes)
+# Captura CSI con PicoScenes (cualquier NIC/SDR compatible,
+# no solo HackRF: Intel AX200/AX210, Atheros ath9k, USRP, etc.)
 # ─────────────────────────────────────────────────────────────
 
 def _picoscenes_binary() -> str | None:
@@ -917,7 +1039,55 @@ def _picoscenes_binary() -> str | None:
     return None
 
 
-def capture_csi_hackrf(duration: int = 10) -> str | None:
+def detect_csi_interfaces(has_hackrf: bool) -> list[str]:
+    """
+    Detecta interfaces compatibles con PicoScenes disponibles en el sistema.
+    No asume HackRF: incluye también NICs WiFi (Intel AX/Atheros vía
+    /sys/class/net en Linux) y USRP si las herramientas están presentes.
+    """
+    candidates: list[str] = []
+
+    if has_hackrf:
+        candidates.append("hackrf0")
+
+    if IS_LINUX:
+        try:
+            for iface_dir in glob.glob("/sys/class/net/*/wireless"):
+                iface = iface_dir.split("/")[4]
+                if iface not in candidates:
+                    candidates.append(iface)
+        except Exception:
+            pass
+        if shutil.which("uhd_find_devices"):
+            r = _run(["uhd_find_devices"])
+            if r.returncode == 0 and r.stdout.strip():
+                candidates.append("usrp0")
+
+    return candidates
+
+
+def choose_csi_interface(has_hackrf: bool) -> str | None:
+    """Auto-selecciona la interfaz si solo hay una, o pregunta si hay varias."""
+    interfaces = detect_csi_interfaces(has_hackrf)
+    if not interfaces:
+        return None
+    if len(interfaces) == 1:
+        return interfaces[0]
+
+    print("\nSe detectaron varias interfaces compatibles con PicoScenes:")
+    for i, iface in enumerate(interfaces):
+        print(f"  [{i}] {iface}")
+    sel = input("Selecciona interfaz [0]: ").strip()
+    if not sel:
+        return interfaces[0]
+    if sel.isdigit() and 0 <= int(sel) < len(interfaces):
+        return interfaces[int(sel)]
+    print("Selección inválida, usando la primera.")
+    return interfaces[0]
+
+
+def capture_csi(interface: str, duration: int = 10) -> str | None:
+    """Captura CSI con PicoScenes usando cualquier interfaz soportada."""
     tqdm = _get_tqdm()
     ps   = _picoscenes_binary()
 
@@ -935,13 +1105,13 @@ def capture_csi_hackrf(duration: int = 10) -> str | None:
 
     cmd = [
         ps, "-d", "debug",
-        "-i", "hackrf0",
+        "-i", interface,
         "--mode", "logger",
         "--freq", "2447",
         "--rx-gain", "60",
         "--output-dir", out_dir,
     ]
-    print(f"📥 Grabando {duration}s de CSI con HackRF...")
+    print(f"📥 Grabando {duration}s de CSI con interfaz '{interface}'...")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
@@ -1253,17 +1423,19 @@ def main() -> None:
         print("        WiFi-Wall-Vision  –  Menú Principal")
         print(f"        SO: {platform.system()}  |  Pantalla: {'Sí' if HAS_DISPLAY else 'No'}")
         print("=" * 62)
+        csi_interfaces = detect_csi_interfaces(has_hackrf)
         r_tag = "" if has_rtlsdr else "  [sin dispositivo]"
-        h_tag = "" if has_hackrf else "  [sin dispositivo]"
+        c_tag = "" if csi_interfaces else "  [sin dispositivo]"
         d_tag = f"  ({csi_data.shape[0]} frames cargados)" if csi_data is not None else "  [sin datos]"
         print(f"[1] Re-escanear dispositivos SDR")
         print(f"[2] Mostrar redes WiFi cercanas")
         print(f"[3] Escaneo de potencia WiFi RTL-SDR{r_tag}")
-        print(f"[4] Capturar CSI con HackRF{h_tag}")
-        print(f"[5] Cargar archivo CSI del disco")
-        print(f"[6] Descargar dataset demo")
-        print(f"[7] Generar imagen con IA{d_tag}")
-        print(f"[8] Salir")
+        print(f"[4] Capturar CSI (cualquier NIC/SDR compatible con PicoScenes){c_tag}")
+        print(f"[5] Modo sin hardware: visión aproximada solo con WiFi")
+        print(f"[6] Cargar archivo CSI del disco")
+        print(f"[7] Descargar dataset demo")
+        print(f"[8] Generar imagen con IA{d_tag}")
+        print(f"[9] Salir")
         op = input("Opción: ").strip()
 
         if op == "1":
@@ -1283,10 +1455,13 @@ def main() -> None:
             _pause()
 
         elif op == "4":
-            if not has_hackrf:
-                print("⚠️  HackRF no disponible.")
+            if not csi_interfaces:
+                print("⚠️  No se detectó ninguna interfaz compatible con PicoScenes "
+                      "(HackRF, NIC WiFi soportada o USRP).")
+                print("   Usa [5] para una alternativa sin hardware especial.")
             else:
-                path = capture_csi_hackrf()
+                iface = choose_csi_interface(has_hackrf)
+                path  = capture_csi(iface)
                 if path:
                     try:
                         csi_data = load_csi_file(path)
@@ -1296,11 +1471,15 @@ def main() -> None:
             _pause()
 
         elif op == "5":
+            wifi_rssi_vision()
+            _pause()
+
+        elif op == "6":
             files = filter_csi_files()
             if not files:
                 print("No se encontraron archivos CSI en la carpeta actual.")
                 print("Extensiones buscadas: .csi  .pcap  .npy  .dat (>1 MB)")
-                print("Usa [6] para descargar el dataset demo.")
+                print("Usa [7] para descargar el dataset demo.")
             else:
                 print("\nArchivos disponibles:")
                 for i, f in enumerate(files):
@@ -1333,7 +1512,7 @@ def main() -> None:
                     print("Entrada inválida.")
             _pause()
 
-        elif op == "6":
+        elif op == "7":
             path = download_demo()
             if path:
                 try:
@@ -1343,9 +1522,9 @@ def main() -> None:
                     print(f"❌ Error al cargar demo: {e}")
             _pause()
 
-        elif op == "7":
+        elif op == "8":
             if csi_data is None:
-                print("⚠️  Primero carga datos CSI (opciones 4, 5 o 6).")
+                print("⚠️  Primero carga datos CSI (opciones 4, 6 o 7).")
             else:
                 model, device = get_model()
                 if model is None:
@@ -1361,12 +1540,12 @@ def main() -> None:
                         print(f"❌ Error al generar imagen: {e}")
             _pause()
 
-        elif op == "8":
+        elif op == "9":
             print("👋 Saliendo.")
             break
 
         else:
-            print("❌ Opción no válida. Elige entre 1 y 8.")
+            print("❌ Opción no válida. Elige entre 1 y 9.")
 
 
 if __name__ == "__main__":

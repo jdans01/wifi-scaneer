@@ -346,8 +346,9 @@ def _register_dll_dir(directory: str) -> None:
 def _copy_dlls_to_scripts(src_dir: str) -> None:
     """
     Copia todas las DLLs al directorio de python.exe y crea alias
-    rtlsdr.dll ↔ librtlsdr.dll porque pyrtlsdr busca 'librtlsdr'
-    mientras el binario oficial se llama 'rtlsdr.dll'.
+    librtlsdr.dll ↔ rtlsdr.dll: pyrtlsdr busca 'librtlsdr' (el nombre que
+    usa el fork librtlsdr/librtlsdr), pero por compatibilidad con builds
+    antiguas que se llaman 'rtlsdr.dll' se deja también ese alias.
     """
     dst = _scripts_dir()
     for fname in os.listdir(src_dir):
@@ -358,10 +359,10 @@ def _copy_dlls_to_scripts(src_dir: str) -> None:
             except Exception:
                 pass
 
-    # Crear/actualizar alias rtlsdr.dll -> librtlsdr.dll (siempre se sobrescribe
-    # para no dejar un alias desactualizado tras una nueva descarga)
-    src = os.path.join(dst, "rtlsdr.dll")
-    alias = os.path.join(dst, "librtlsdr.dll")
+    # Crear/actualizar alias librtlsdr.dll -> rtlsdr.dll (siempre se
+    # sobrescribe para no dejar un alias desactualizado tras una descarga)
+    src = os.path.join(dst, "librtlsdr.dll")
+    alias = os.path.join(dst, "rtlsdr.dll")
     if os.path.isfile(src):
         try:
             shutil.copy2(src, alias)
@@ -371,9 +372,10 @@ def _copy_dlls_to_scripts(src_dir: str) -> None:
 
 def _dll_has_v4_support(path: str) -> bool:
     """
-    Verifica que la DLL exporte rtlsdr_set_dithering, función presente solo
-    en el fork de rtlsdrblog (necesaria para RTL-SDR v4 con tuner R828D).
-    El driver clásico de osmocom no la tiene y falla al usarse con v4.
+    Verifica que la DLL exporte rtlsdr_set_dithering. Esa función solo
+    existe en el fork librtlsdr/librtlsdr (no en osmocom/rtl-sdr ni en
+    rtlsdrblog/rtl-sdr-blog), y pyrtlsdr 0.4.x la requiere obligatoriamente
+    al importar el módulo, sin importar si el dispositivo es v3 o v4.
 
     Libera la librería explícitamente tras la verificación: si no se hace,
     Windows mantiene el archivo bloqueado en este proceso, lo que impide
@@ -394,9 +396,9 @@ def _dll_has_v4_support(path: str) -> bool:
 
 
 def _dll_loadable() -> bool:
-    """Verifica si rtlsdr/librtlsdr es cargable con ctypes y soporta v4."""
+    """Verifica si librtlsdr/rtlsdr es cargable con ctypes y soporta v4."""
     scripts = _scripts_dir()
-    for name in ("rtlsdr", "librtlsdr"):
+    for name in ("librtlsdr", "rtlsdr"):
         full = os.path.join(scripts, f"{name}.dll")
         if os.path.isfile(full) and _dll_has_v4_support(full):
             return True
@@ -405,22 +407,20 @@ def _dll_loadable() -> bool:
 
 def _download_rtlsdr_dlls() -> str | None:
     """
-    Descarga el zip de RTL-SDR, extrae solo las DLLs de la arquitectura
-    correcta (x64 para Python 64-bit, x32 para 32-bit) y las copia a Scripts/.
+    Descarga librtlsdr.dll (build estática, sin dependencias externas como
+    libusb) desde librtlsdr/librtlsdr, el único fork cuyo binario expone
+    rtlsdr_set_dithering, requerido por pyrtlsdr 0.4.x.
     """
     import tempfile
 
-    arch_hint = "x64" if _IS_64BIT else "x32"
-    # Solo el fork de rtlsdrblog soporta RTL-SDR v4 (función rtlsdr_set_dithering).
-    # El driver clásico de osmocom NO sirve para v4, así que no se usa como mirror.
-    mirrors = [
-        "https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest/download/Release.zip",
-    ]
+    arch_hint = "w64" if _IS_64BIT else "w32"
+    url = (f"https://github.com/librtlsdr/librtlsdr/releases/latest/"
+           f"download/rtlsdr-bin-{arch_hint}_static.zip")
 
     dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls")
     os.makedirs(dll_dir, exist_ok=True)
 
-    cached = os.path.join(dll_dir, "rtlsdr.dll")
+    cached = os.path.join(dll_dir, "librtlsdr.dll")
     if os.path.isfile(cached):
         if _dll_has_v4_support(cached):
             return dll_dir
@@ -429,50 +429,43 @@ def _download_rtlsdr_dlls() -> str | None:
         shutil.rmtree(dll_dir, ignore_errors=True)
         os.makedirs(dll_dir, exist_ok=True)
 
-    print("⚙️  Descargando DLLs de RTL-SDR...")
-    for url in mirrors:
-        host = "/".join(url.split("/")[2:5])
-        print(f"   → {host} ...")
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="rtlsdr_")
-        os.close(tmp_fd)
+    print("⚙️  Descargando librtlsdr.dll...")
+    host = "/".join(url.split("/")[2:5])
+    print(f"   → {host} ...")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="rtlsdr_")
+    os.close(tmp_fd)
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        with zipfile.ZipFile(tmp_path, "r") as z:
+            dll_entries = [n for n in z.namelist() if n.lower().endswith("librtlsdr.dll")]
+            if not dll_entries:
+                print("   ✗ zip sin librtlsdr.dll.")
+                return None
+            data = z.read(dll_entries[0])
+            with open(os.path.join(dll_dir, "librtlsdr.dll"), "wb") as f:
+                f.write(data)
+
+        extracted = os.path.join(dll_dir, "librtlsdr.dll")
+        if not _dll_has_v4_support(extracted):
+            print("   ✗ DLL descargada no soporta RTL-SDR v4.")
+            return None
+
+        _copy_dlls_to_scripts(dll_dir)
+        _register_dll_dir(dll_dir)
+        print(f"   ✅ librtlsdr.dll ({arch_hint}) lista, con soporte RTL-SDR v4.")
+        return dll_dir
+    except Exception as e:
+        print(f"   ✗ {e}")
+        return None
+    finally:
         try:
-            urllib.request.urlretrieve(url, tmp_path)
-            with zipfile.ZipFile(tmp_path, "r") as z:
-                all_dlls = [n for n in z.namelist() if n.lower().endswith(".dll")]
-                # Preferir DLLs en subcarpeta x64/ (o x32/)
-                arch_dlls = [n for n in all_dlls if f"/{arch_hint}/" in n.lower() or
-                             n.lower().startswith(arch_hint + "/")]
-                chosen = arch_dlls if arch_dlls else all_dlls
-                if not chosen:
-                    print("   ✗ zip sin DLLs.")
-                    continue
-                for entry in chosen:
-                    data = z.read(entry)
-                    dest = os.path.join(dll_dir, os.path.basename(entry))
-                    with open(dest, "wb") as f:
-                        f.write(data)
-
-            extracted = os.path.join(dll_dir, "rtlsdr.dll")
-            if not os.path.isfile(extracted) or not _dll_has_v4_support(extracted):
-                print("   ✗ DLL extraída no soporta RTL-SDR v4, probando siguiente mirror...")
-                continue
-
-            _copy_dlls_to_scripts(dll_dir)
-            _register_dll_dir(dll_dir)
-            print(f"   ✅ DLLs ({arch_hint}) listas, con soporte RTL-SDR v4.")
-            return dll_dir
-        except Exception as e:
-            print(f"   ✗ {e}")
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    return None
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def _ensure_rtlsdr_dlls_windows() -> bool:
-    """Garantiza que rtlsdr.dll es cargable. Totalmente automático."""
+    """Garantiza que librtlsdr.dll es cargable. Totalmente automático."""
     if _dll_loadable():
         return True
 
@@ -481,7 +474,7 @@ def _ensure_rtlsdr_dlls_windows() -> bool:
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "rtlsdr_dlls"),
         _scripts_dir(),
     ]:
-        if os.path.isfile(os.path.join(search_dir, "rtlsdr.dll")):
+        if os.path.isfile(os.path.join(search_dir, "librtlsdr.dll")):
             _register_dll_dir(search_dir)
             _copy_dlls_to_scripts(search_dir)
             if _dll_loadable():
@@ -492,8 +485,9 @@ def _ensure_rtlsdr_dlls_windows() -> bool:
     if dll_dir and _dll_loadable():
         return True
 
-    print(f"\n   ⚠️  rtlsdr.dll no cargable. Copia manualmente a: {_scripts_dir()}")
-    print("   Descarga: https://github.com/rtlsdrblog/rtl-sdr-blog/releases/latest")
+    print(f"\n   ⚠️  librtlsdr.dll no cargable. Copia manualmente a: {_scripts_dir()}")
+    print("   Descarga: https://github.com/librtlsdr/librtlsdr/releases/latest"
+          " (rtlsdr-bin-w64_static.zip o w32_static.zip)")
     print("   Driver USB: https://zadig.akeo.ie  →  RTL-SDR → WinUSB")
     return False
 
